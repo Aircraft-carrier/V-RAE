@@ -1,0 +1,13 @@
+dit:
+  name: vrae_video_dit
+  input_dim: 1024
+  hidden_size: [1536, 2048]
+  depth: [28, 2]
+  encoder_depth: 8
+  num_heads: [24, 16]
+  mlp_ratio: 4.0
+  time_embed_dim: 256
+  class_dropout: 0.1
+  num_classes: 101
+  rope_theta: 10000.0
+  gradient_checkpointing: true

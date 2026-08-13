@@ -1,0 +1,18 @@
+model:
+  decoder:
+    name: vrae_decoder
+    hidden_size: 1152
+    depth: 28
+    num_heads: 16
+    mlp_ratio: 3.5555555555555554
+    patch_size: 16
+    tubelet_size: 4
+    image_size: [256, 256]
+    num_channels: 3
+    layer_norm_eps: 1.0e-12
+    attention_dropout: 0.0
+    attention_mode: chunk_causal
+    attention_backend: auto
+    rope_theta: 10000.0
+    gradient_checkpointing: false
+    init: scratch
