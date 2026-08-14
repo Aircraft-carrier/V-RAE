@@ -1,6 +1,6 @@
 # V-RAE: Rethinking Video Latent Spaces for Generation
 
-**Official PyTorch Implementation**
+<!-- **Official PyTorch Implementation** -->
 
 <p>
   <a href="https://arxiv.org/abs/2608.13556"><img src="https://img.shields.io/badge/Paper-arXiv-b31b1b" alt="Paper"></a>
@@ -8,17 +8,19 @@
   <a href="https://huggingface.co/Guomh0707/V-RAE-Models"><img src="https://img.shields.io/badge/Model-Hugging%20Face-yellow" alt="Model"></a>
 </p>
 
+![V-RAE method](assets/V-RAE.png)
+V-RAE is a video representation autoencoder that builds compact generative latents on top of frozen vision foundation model representations. A lightweight temporal pooling module removes temporal redundancy while preserving semantic structure, and a video decoder reconstructs continuous motion from the compressed features.
+
+
 ![V-RAE overview](assets/V-RAE-overall.png)
+We evaluate V-RAE with four representative frozen encoders (e.g., `DINOv3`, `SigLIP2`, `V-JEPA2.1`, and `EUPE`) on video reconstruction, semantic probing, and class-conditional generation:
+- V-RAE achieves **2.13 rFVD** on K600, outperforming all evaluated large-scale pretrained video VAEs
+- V-RAE achieves **117.86** and **19.16** gFVD on UCF101 and K600, respectively, while
+converging up to **6× faster**.
+- **tFVD** increases the high Pearson correlations to 𝑟 = 0.621 on UCF101 and 𝑟 = 0.919 on K600, respectively, comparing to rFVD.
+- Semantic latents yielded from V-RAE form a directly decodable predictive state space.
 
-V-RAE provides unified pipelines for video reconstruction and video generation with four visual encoder variants: DINOv3, SigLIP2, V-JEPA2.1, and EUPE.
 
-| Task | Dataset | Launcher or Module |
-| --- | --- | --- |
-| Reconstruction training | UCF101 + Kinetics-600 | `scripts/train/reconstruction.sh` |
-| Reconstruction fine-tuning | CoVLA | `scripts/train/covla_reconstruction.sh` |
-| Class-conditional generation training | UCF101 | `scripts/train/ucf101.sh` |
-| Class-conditional generation training | Kinetics-600 | `scripts/train/k600.sh` |
-| Future-frame generation training | Cityscapes | `vrae.training.cityscapes_video_pred.train` |
 
 ## Repository Layout
 
@@ -38,37 +40,50 @@ V-RAE/
 
 ## Installation
 
-Set up the environment and install V-RAE:
+The released training and evaluation recipes are intended for Linux systems with NVIDIA GPUs. Before installation, make sure the machine has a CUDA-compatible driver and FFmpeg available; FFmpeg is required by TorchCodec for video decoding. Python 3.10 or later is required.
 
 ```bash
+git clone https://github.com/V-RAE/V-RAE.git
+cd V-RAE
+
 conda create -n vrae python=3.10 -y
 conda activate vrae
+conda install -c conda-forge ffmpeg -y
+
 pip install uv
 uv pip install -e .
 ```
 
-You can also install it with:
+This installs the pinned PyTorch, TorchVision, TorchCodec, Transformers, and other runtime dependencies declared in `pyproject.toml`. Verify that PyTorch can access CUDA and that TorchCodec can load its video decoder:
 
 ```bash
-uv pip install -r requirements.txt
+python -c "import torch; from torchcodec.decoders import VideoDecoder; import vrae; print(f'V-RAE {vrae.__version__} | PyTorch {torch.__version__} | CUDA {torch.version.cuda} | GPU available: {torch.cuda.is_available()}')"
 ```
 
-## Data and Local Paths
+## Data and Encoder Weights Preparation
 
-Prepare the following datasets:
+### Dataset Downloading
+Download only the datasets needed for the training and evaluation:
 
-- [UCF101](https://huggingface.co/datasets/quchenyuan/UCF101-ZIP/tree/04d4e5ca1dc93606cb58752b0c08331e598743a4)
-- [Kinetics-600](https://opendatalab.com/OpenMMLab/Kinetics600)
-- [Cityscapes](https://www.cityscapes-dataset.com/downloads/) (only `leftImg8bit_sequence_trainvaltest.zip` is required)
-- CoVLA (set its dataset root in the local path file)
+| Dataset | Used for |
+| --- | --- |
+| [UCF101](https://huggingface.co/datasets/quchenyuan/UCF101-ZIP/tree/04d4e5ca1dc93606cb58752b0c08331e598743a4) | Reconstruction and UCF101 class-conditional generation |
+| [Kinetics-600](https://opendatalab.com/OpenMMLab/Kinetics600) | Reconstruction and K600 class-conditional generation |
+| [Cityscapes](https://www.cityscapes-dataset.com/downloads/) | Future-frame generation (only `leftImg8bit_sequence_trainvaltest.zip` is required) |
+| [CoVLA](https://huggingface.co/datasets/turing-motors/CoVLA-Dataset) | Reconstruction fine-tuning |
 
-Create the machine-local training path file from the checked-in template:
+### Pre-trained encoder weights downloading
+In our experiments, we conduct experiments on four representative encoders, including `DINOv3`, `SigLIP2`, `V-JEPA2.1`, and `EUPE`.
+See [third-party/README](third_party/README.md) for details.
+
+### Setting paths
+ 
+Create a specific path YAML file based on the provided template:
 
 ```bash
 cp configs/paths.example.yaml configs/paths.local.yaml
 ```
-
-Then replace the placeholders in `configs/paths.local.yaml`:
+Then replace the placeholders in `configs/paths.local.yaml`. Set `project_root` to this repository and update each dataset root. Absolute paths are recommended; relative dataset and third-party paths are resolved from `project_root`.
 
 ```yaml
 project_root: path/to/V-RAE
@@ -78,9 +93,9 @@ datasets:
   cityscapes: path/to/Cityscapes
   covla: path/to/CoVLA-Dataset
 third_party:
-  dinov3: path/to/V-RAE/third_party/dinov3
-  eupe: path/to/V-RAE/third_party/eupe
-  vjepa2_1: path/to/V-RAE/third_party/vjepa2
+  dinov3: path/to/ckpts/pretrained/encoders/dinov3
+  eupe: path/to/ckpts/pretrained/encoders/eupe
+  vjepa2_1: path/to/ckpts/pretrained/encoders/vjepa2
 ```
 
 The launchers under `scripts/train/` automatically use `configs/paths.local.yaml` when it exists. Set `VRAE_PATHS_FILE=path/to/another.yaml` to select a different training path file. Direct `python -m` or `torchrun -m` training commands do not load the local file automatically; pass it explicitly with `--paths`.
@@ -94,9 +109,10 @@ inputs:
 
 Datasets, training manifests, and evaluation population manifests are local inputs and are not bundled with the source repository. The default recipes reference them under the Git-ignored `data/metadata/` directory; place the required local files there using the configured filenames. For evaluation, the relevant fields are `inputs.data_root`, `inputs.population`, and, when present, `inputs.population_metadata`.
 
+
 ## Model Weights
 
-V-RAE and generation model checkpoints are available from [Guomh0707/V-RAE-Models](https://huggingface.co/Guomh0707/V-RAE-Models). Download the complete repository into the expected local layout:
+V-RAE and generation model checkpoints are available from [V-RAE-Models](https://huggingface.co/Guomh0707/V-RAE-Models). Download the complete repository into the expected local layout:
 
 ```bash
 hf download Guomh0707/V-RAE-Models --local-dir ckpts
@@ -163,6 +179,14 @@ outputs/<variant>/sample3-comparison.mp4
 Run the commands below from the repository root. The reconstruction, UCF101, and Kinetics-600 launchers take the number of nodes, GPUs per node, current node rank, and V-RAE variant in that order. The accepted short variant names are `dino`, `siglip`, `vjepa`, and `eupe`.
 
 For multi-node jobs, use the same `MASTER_ADDR` and `MASTER_PORT` on every machine. `MASTER_ADDR` must identify node 0 and be reachable from all participating nodes.
+
+| Task | Dataset | Launcher or Module |
+| --- | --- | --- |
+| Reconstruction training | UCF101 + Kinetics-600 | `scripts/train/reconstruction.sh` |
+| Reconstruction fine-tuning | CoVLA | `scripts/train/covla_reconstruction.sh` |
+| Class-conditional generation training | UCF101 | `scripts/train/ucf101.sh` |
+| Class-conditional generation training | Kinetics-600 | `scripts/train/k600.sh` |
+| Future-frame generation training | Cityscapes | `vrae.training.cityscapes_video_pred.train` |
 
 ### Reconstruction Training
 
