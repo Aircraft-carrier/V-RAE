@@ -454,3 +454,14 @@ torchrun --standalone --nproc_per_node=8 \
 The codebase is built upon some amazing projects: [RAE](https://github.com/bytetriper/RAE), [RAEv2](https://github.com/nanovisionx/RAEv2), [DINOv3](https://github.com/facebookresearch/dinov3), [SigLIP2](https://huggingface.co/google/siglip2-large-patch16-256), [V-JEPA 2](https://github.com/facebookresearch/vjepa2), [EUPE](https://github.com/facebookresearch/EUPE), and [EVATok](https://github.com/HKU-MMLab/EVATok). We thank the authors for making their work publicly available.
 
 We also sincerely thank [Saining Xie](https://www.sainingxie.com/) for his direct guidance and valuable feedback, which has greatly helped to shape V-RAE.
+
+## BibTeX
+
+```bibtex
+@article{guo2026vrae,
+  title   = {V-RAE: Rethinking Video Latent Spaces for Generation},
+  author  = {Guo, Minghui and Wu, Shengqiong and Fei, Hao},
+  journal = {arXiv preprint arXiv:2608.13556},
+  year    = {2026},
+}
+```
