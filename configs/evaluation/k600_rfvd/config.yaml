@@ -5,7 +5,7 @@ checkpoints:
   stage1: ckpts/vrae/replace-with-vrae.pt
 extractors:
   i3d: ckpts/eval_models/i3d_torchscript.pt
-  lpips: ckpts/eval_models/lpips/lpips_vgg.pt
+  lpips: ckpts/pretrained/perceptual/lpips_vgg.pt
 inputs:
   population: data/metadata/k600_val_rfvd_torchcodec_approximate.json
   population_metadata: data/metadata/k600_val_rfvd.metadata.json

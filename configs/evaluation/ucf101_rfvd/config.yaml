@@ -5,7 +5,7 @@ checkpoints:
   stage1: ckpts/vrae/replace-with-vrae.pt
 extractors:
   i3d: ckpts/eval_models/i3d_torchscript.pt
-  lpips: ckpts/eval_models/lpips/lpips_vgg.pt
+  lpips: ckpts/pretrained/perceptual/lpips_vgg.pt
 inputs:
   population: data/metadata/ucf101_test_split1_rfvd.json
   population_metadata: null
