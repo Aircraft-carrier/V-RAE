@@ -2,7 +2,7 @@ include:
   - ../../models/vrae_vjepa2_1_l_k7.yaml
   - ../../models/dit_class_cond.yaml
 task: ucf_videogen
-run_name: vjepa2_1_ucf101_16f_frame_interval_1
+run_name: vjepa2_1_ucf101
 model:
   decoder:
     attention_mode: full
@@ -11,7 +11,7 @@ stage1:
   weights: ema
   precision: bf16
 latent_normalizer:
-  path: ckpts/ucf_videogen/latent_stats/vjepa2_1_ucf101_16f_vrae_ema_full_bf16.pt
+  path: ckpts/ucf_videogen/latent_stats/vjepa2_1_ucf101_20f_vrae_ema_full_bf16.pt
 dit:
   num_classes: 101
   attention_backend: auto
@@ -19,7 +19,7 @@ dit:
 transport:
   prediction: x
   time_dist_type: logit-normal_0_1
-  time_dist_shift: 16.0
+  time_dist_shift: 17.88854381999832
   t_eps: 0.05
   base_model_coeff: 1.0
 training:
@@ -40,8 +40,8 @@ data:
   manifest: data/metadata/ucf101_train_split1.csv
   manifest_scope: project
   manifest_split: null
-  num_frames: 16
-  frame_interval: 1
+  num_frames: 20
+  frame_interval: 3
   image_size: 256
   video_backend: torchcodec
   max_decode_attempts: 128
@@ -79,7 +79,7 @@ sampling:
 wandb:
   project: V-RAE
   group: ucf101_videogen
-  tags: [ucf101, class_conditional, vjepa2_1, 16f, ema, full_attention, frame_interval_1]
+  tags: [ucf101, class_conditional, vjepa2_1, 20f]
   mode: online
   resume: never
   log_interval: 20
