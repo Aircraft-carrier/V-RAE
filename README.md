@@ -28,7 +28,45 @@ converging up to **6× faster**.
 - **tFVD** increases the high Pearson correlations to 𝑟 = 0.621 on UCF101 and 𝑟 = 0.919 on K600, respectively, comparing to rFVD.
 - Semantic latents yielded from V-RAE form a directly decodable predictive state space.
 
+## Visual Results
 
+The examples below follow the same progression as our evaluation: from faithful video reconstruction, to class-conditional generation, and finally to future prediction in the learned latent space.
+
+### Video Reconstruction
+
+V-RAE preserves fine spatial detail and coherent motion while operating on compact semantic latents.
+
+<p align="center">
+  <a href="assets/video-reconstruction-comparison.gif">
+    <img src="assets/video-reconstruction-comparison.gif" alt="Video reconstruction comparison between ground truth, RAEv2, Wan 2.2 VAE, and V-RAE" width="88%">
+  </a>
+</p>
+
+### Class-Conditional Video Generation
+
+The same latent space supports diverse class-conditional generation on both UCF101 and Kinetics-600.
+
+<p align="center">
+  <a href="assets/class-conditional-video-generation-ucf101.gif">
+    <img src="assets/class-conditional-video-generation-ucf101.gif" alt="Class-conditional video generation on UCF101" width="88%">
+  </a>
+</p>
+
+<p align="center">
+  <a href="assets/class-conditional-video-generation-k600.gif">
+    <img src="assets/class-conditional-video-generation-k600.gif" alt="Class-conditional video generation on Kinetics-600" width="88%">
+  </a>
+</p>
+
+### Future Prediction
+
+Beyond reconstruction and generation, V-RAE provides a directly decodable state space for forecasting future video frames.
+
+<p align="center">
+  <a href="assets/world-model-future-prediction.gif">
+    <img src="assets/world-model-future-prediction.gif" alt="Future video prediction comparison between ground truth, Wan 2.2, and V-RAE" width="88%">
+  </a>
+</p>
 
 ## Repository Layout
 

@@ -123,8 +123,9 @@ junit*.xml
 *.gif
 *.webp
 
-# The project overview is a release asset, not dataset content.
-!/assets/V-RAE-overall.png
+# README and project media are release assets, not dataset content.
+!/assets/
+!/assets/**
 
 # Training, evaluation, sampling, and profiling outputs
 /output/
