@@ -123,6 +123,16 @@ junit*.xml
 *.gif
 *.webp
 
+# Canonical dataset manifests required by the training and validation configs.
+# Keep every other dataset artifact under data/ ignored.
+!/data/
+/data/*
+!/data/metadata/
+/data/metadata/*
+!/data/metadata/ucf101_train_split1.csv
+!/data/metadata/k600_train.csv
+!/data/metadata/k600_val.csv
+
 # README and project media are release assets, not dataset content.
 !/assets/
 !/assets/**
@@ -224,6 +234,8 @@ Desktop.ini
 !/third_party/dinov3/dinov3/utils/__init__.py
 !/third_party/dinov3/dinov3/utils/dtype.py
 !/third_party/dinov3/dinov3/utils/utils.py
+/dit_sampling.py
+/dit_sampling.sh
 
 /third_party/eupe/*
 !/third_party/eupe/LICENSE.md

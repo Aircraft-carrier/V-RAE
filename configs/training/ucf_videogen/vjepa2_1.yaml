@@ -11,7 +11,7 @@ stage1:
   weights: ema
   precision: bf16
 latent_normalizer:
-  path: ckpts/ucf_videogen/latent_stats/vjepa2_1_ucf101_20f_vrae_ema_full_bf16.pt
+  path: ckpts/ucf_videogen/latent_stats/vjepa2_1_ucf101_20f_published_ema_full_bf16.pt
 dit:
   num_classes: 101
   attention_backend: auto
