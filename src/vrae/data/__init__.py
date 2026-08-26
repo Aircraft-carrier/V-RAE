@@ -13,6 +13,7 @@ from .datasets import (
     load_video_manifest,
     scan_class_directories,
 )
+from .lerobot import LeRobotVideoDataset
 from .sampling import (
     ClipSampler,
     clip_span,
@@ -57,6 +58,7 @@ __all__ = [
     "DirectoryVideoDataset",
     "K600Dataset",
     "Kinetics600Dataset",
+    "LeRobotVideoDataset",
     "ManifestVideoDataset",
     "Normalize",
     "RandomCrop",
