@@ -13,6 +13,7 @@ from vrae.training.common.contracts import (
 )
 from vrae.training.common.ema import ExponentialMovingAverage
 from vrae.checkpoint import (
+    CheckpointError,
     FORMAT_VERSION,
     atomic_torch_save,
     capture_rng_state,
@@ -87,7 +88,13 @@ def load_model_init(
 ) -> dict[str, Any]:
     payload = load_checkpoint(path)
     compare_metadata(expected_metadata, payload["model_metadata"], metadata_fields)
-    model.load_state_dict(payload["model"], strict=True)
+    result = model.load_state_dict(payload["model"], strict=False)
+    allowed_missing = {key for key in result.missing_keys if "view_embedding" in key}
+    if result.unexpected_keys or set(result.missing_keys) != allowed_missing:
+        raise CheckpointError(
+            "Initial checkpoint model keys are incompatible: "
+            f"missing={result.missing_keys} unexpected={result.unexpected_keys}"
+        )
     return payload
 
 

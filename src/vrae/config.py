@@ -112,8 +112,37 @@ def validate_config(config: Mapping[str, Any]) -> None:
         if backend not in {"sdpa", "fa3", "fa3_fwd", "fa4_cute", "auto"}:
             raise ConfigError(f"Unknown decoder attention backend: {backend}")
         _checkpoint_relative_to_project(decoder.get("checkpoint"), "model.decoder.checkpoint")
+    multiview = model.get("multiview", {})
+    if multiview:
+        if not isinstance(multiview, Mapping):
+            raise ConfigError("model.multiview must be a mapping")
+        num_views = int(multiview.get("num_views", 1))
+        num_streams = int(multiview.get("num_streams", num_views))
+        if num_views <= 0 or num_streams <= 0 or num_views > num_streams:
+            raise ConfigError("model.multiview requires 0 < num_views <= num_streams")
     data = config.get("data", {})
     if isinstance(data, Mapping):
+        if str(data.get("dataset", "")) == "lerobot":
+            cameras = data.get("camera_keys")
+            if not isinstance(cameras, Sequence) or isinstance(cameras, (str, bytes)) or not cameras:
+                raise ConfigError("data.camera_keys must be a non-empty list for LeRobot")
+            multiview = model.get("multiview", {}) if isinstance(model, Mapping) else {}
+            enabled = bool(multiview.get("enabled", len(cameras) > 1)) if isinstance(multiview, Mapping) else len(cameras) > 1
+            if enabled and int(multiview.get("num_views", len(cameras))) != len(cameras):
+                raise ConfigError("model.multiview.num_views must equal len(data.camera_keys)")
+            keys: set[str] = set()
+            ids: set[int] = set()
+            for index, camera in enumerate(cameras):
+                if isinstance(camera, str):
+                    key, stream_id = camera, index
+                elif isinstance(camera, Mapping) and "key" in camera:
+                    key, stream_id = str(camera["key"]), int(camera.get("stream_id", index))
+                else:
+                    raise ConfigError("each data.camera_keys entry requires key")
+                if key in keys or stream_id in ids or stream_id < 0:
+                    raise ConfigError("data.camera_keys keys and stream_id values must be unique")
+                keys.add(key)
+                ids.add(stream_id)
         video_backend = str(data.get("video_backend", "auto"))
         if video_backend not in {"auto", "torchcodec"}:
             raise ConfigError("data.video_backend must be auto or torchcodec")

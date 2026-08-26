@@ -803,6 +803,8 @@ class GANController:
         requires_grad = [parameter.requires_grad for parameter in parameters]
         for parameter in parameters:
             parameter.requires_grad_(False)
+        if reconstructed.ndim == 6:
+            reconstructed = reconstructed.permute(0, 2, 1, 3, 4, 5).reshape(-1, *reconstructed.shape[1:2], *reconstructed.shape[3:])
         try:
             return _generator_loss(
                 discriminator(reconstructed),
@@ -836,6 +838,9 @@ class GANController:
         final_microstep = int(microstep) + 1 == int(accumulation_steps)
         no_sync = getattr(self.discriminator, "no_sync", None)
         sync_context = no_sync() if not final_microstep and callable(no_sync) else nullcontext()
+        if real.ndim == 6:
+            real = real.permute(0, 2, 1, 3, 4, 5).reshape(-1, *real.shape[1:2], *real.shape[3:])
+            reconstructed = reconstructed.permute(0, 2, 1, 3, 4, 5).reshape(-1, *reconstructed.shape[1:2], *reconstructed.shape[3:])
         with sync_context:
             real_logits = self.discriminator(real.detach().to(dtype=discriminator_dtype))
             fake_logits = self.discriminator(reconstructed.detach().to(dtype=discriminator_dtype))

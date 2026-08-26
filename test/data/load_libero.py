@@ -33,7 +33,16 @@ def main() -> None:
         "task",
     }
     assert set(item) == expected_native
-    adapted = LeRobotVideoDataset(ROOT, clip_length=8, sampling="start")
+    adapted = LeRobotVideoDataset(
+        ROOT,
+        clip_length=8,
+        sampling="start",
+        camera_keys=[
+            {"key": "observation.images.image", "name": "head", "stream_id": 0},
+            {"key": "observation.images.image2", "name": "wrist", "stream_id": 1},
+        ],
+        multiview_enabled=True,
+    )
     clip = adapted[0]
     expected_vrae = {
         "video",
@@ -42,9 +51,12 @@ def main() -> None:
         "path",
         "frame_indices",
         "video_metadata",
+        "stream_ids",
         "extra",
     }
     assert set(clip) == expected_vrae
+    assert tuple(clip["video"].shape) == (8, 2, 3, 256, 256)
+    assert tuple(clip["stream_ids"].tolist()) == (0, 1)
     print(f"native: {len(native)} frames, keys={sorted(item)}")
     print(f"adapted: {len(adapted)} episodes, video={tuple(clip['video'].shape)}")
     print(f"sample_id={clip['sample_id']} label={clip['label']} task={clip['extra']['task']}")

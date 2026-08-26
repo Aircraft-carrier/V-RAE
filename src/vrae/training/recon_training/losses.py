@@ -384,6 +384,12 @@ class ReconstructionLoss(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if reconstructed.shape != target.shape:
             raise ValueError("Reconstruction and target shapes differ")
+        if reconstructed.ndim == 6:
+            batch, time, views, channels, height, width = reconstructed.shape
+            reconstructed = reconstructed.permute(0, 2, 1, 3, 4, 5).reshape(batch * views, time, channels, height, width)
+            target = target.permute(0, 2, 1, 3, 4, 5).reshape(batch * views, time, channels, height, width)
+        elif reconstructed.ndim != 5:
+            raise ValueError("Reconstruction inputs must be [B,T,3,H,W] or [B,T,V,3,H,W]")
         zero = reconstructed.new_zeros(())
         l1 = F.l1_loss(reconstructed, target) if self.weights["l1"] else zero
         temporal = (
@@ -413,10 +419,15 @@ class ReconstructionLoss(nn.Module):
         }
 
     def forward(
-        self, reconstructed: torch.Tensor, target: torch.Tensor
+        self, reconstructed: torch.Tensor, target: torch.Tensor, stream_ids: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        return (
+        result = (
             self._compiled_forward(reconstructed, target)
             if self._compiled_forward is not None
             else self._forward_impl(reconstructed, target)
         )
+        if stream_ids is not None and reconstructed.ndim == 6 and stream_ids.ndim == 2:
+            per_view = (reconstructed - target).abs().mean(dim=(0, 1, 3, 4, 5)).detach()
+            for view, stream in enumerate(stream_ids[0].tolist()):
+                result[1][f"l1_stream_{int(stream)}"] = per_view[view]
+        return result

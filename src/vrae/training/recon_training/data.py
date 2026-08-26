@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from vrae.training.common.contracts import resolve_batch_contract
 from vrae.training.common.sampler import StatefulDistributedBatchSampler
 from vrae.data.datasets import Kinetics600Dataset, UCF101Dataset, VideoDataset, VideoRecord
+from vrae.data.lerobot import LeRobotVideoDataset
 from vrae.data.transforms import random_crop_video, resize_short_side, uint8_to_float
 from vrae.paths import ProjectPaths
 
@@ -38,6 +39,8 @@ class CudaVideoPrefetchIterator:
             return
         with torch.cuda.stream(self.stream):
             batch["video"] = batch["video"].to(self.device, non_blocking=True)
+            if "stream_ids" in batch:
+                batch["stream_ids"] = batch["stream_ids"].to(self.device, non_blocking=True)
         self._next_batch = batch
 
     def __next__(self) -> dict[str, Any]:
@@ -47,6 +50,8 @@ class CudaVideoPrefetchIterator:
         current_stream = torch.cuda.current_stream(self.device)
         current_stream.wait_stream(self.stream)
         batch["video"].record_stream(current_stream)
+        if "stream_ids" in batch:
+            batch["stream_ids"].record_stream(current_stream)
         self._preload()
         return batch
 
@@ -194,6 +199,8 @@ def _source_records(
             clip_length=4,
             require_temporal_multiple_of_four=True,
         )
+    elif name == "lerobot":
+        raise ValueError("Use build_reconstruction_dataset for LeRobot sources")
     else:
         raise ValueError(f"Reconstruction source must be ucf101 or k600, got {name!r}")
     return [
@@ -212,6 +219,23 @@ def build_reconstruction_dataset(
     config: Mapping[str, Any], paths: ProjectPaths
 ) -> ReconstructionDataset:
     data = config["data"]
+    if str(data.get("dataset", "")) == "lerobot":
+        root_value = data.get("root")
+        root = Path(str(root_value)).expanduser() if root_value else paths.dataset("lerobot")
+        camera_keys = data.get("camera_keys")
+        multiview = config.get("model", {}).get("multiview", {})
+        return LeRobotVideoDataset(
+            root,
+            repo_id=str(data.get("repo_id", "libero")),
+            clip_length=int(data.get("num_frames", 16)),
+            frame_interval=int(data.get("frame_interval", 1)),
+            sampling=str(data.get("sampling", "random")),
+            base_seed=int(data.get("seed", 3407)),
+            camera_keys=camera_keys,
+            image_size=int(data["image_size"]) if data.get("image_size") is not None else None,
+            random_flip=bool(data.get("random_flip", False)),
+            multiview_enabled=bool(multiview.get("enabled", bool(camera_keys and len(camera_keys) > 1))),
+        )
     sources = data.get("sources", ("ucf101", "k600"))
     records: list[VideoRecord] = []
     for source in sources:
@@ -246,6 +270,10 @@ def collate_reconstruction(items: list[dict[str, Any]]) -> dict[str, Any]:
             [int(item.get("decode_attempts", 1)) for item in items], dtype=torch.long
         ),
     }
+    if "stream_ids" in items[0]:
+        stream_ids = torch.stack([item["stream_ids"] for item in items])
+        if any(item["video"].ndim == 5 for item in items):
+            batch["stream_ids"] = stream_ids
     return batch
 
 

@@ -30,6 +30,7 @@ DEFAULT_DATASET_PATHS = {
     "k600": Path("data/Kinetics-600"),
     "cityscapes": Path("data/Cityscapes"),
     "covla": Path("data/CoVLA-Dataset"),
+    "lerobot": Path("data/Lerobot/libero"),
 }
 DEFAULT_THIRD_PARTY_PATHS = {
     "dinov3": Path("third_party/dinov3"),

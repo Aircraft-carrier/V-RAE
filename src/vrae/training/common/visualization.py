@@ -8,8 +8,11 @@ import torch
 
 
 def video_to_uint8(video: torch.Tensor) -> torch.Tensor:
+    if video.ndim == 6:
+        batch, time, views, channels, height, width = video.shape
+        video = video.permute(0, 2, 1, 3, 4, 5).reshape(batch * views, time, channels, height, width)
     if video.ndim != 5:
-        raise ValueError("Expected video [B,T,C,H,W]")
+        raise ValueError("Expected video [B,T,C,H,W] or [B,T,V,C,H,W]")
     if video.dtype == torch.uint8:
         return video
     return video.detach().float().clamp(0, 1).mul(255).round().to(torch.uint8)

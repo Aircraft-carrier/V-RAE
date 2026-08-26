@@ -57,6 +57,7 @@ class VRAE(nn.Module):
         self.encoder = encoder
         self.temporal_pool = temporal_pool
         self.decoder = decoder
+        self.multiview_camera_keys: list[dict[str, Any]] = []
         self.encoder.requires_grad_(False)
         self.encoder.eval()
         self.temporal_pool.requires_grad_(True)
@@ -89,10 +90,22 @@ class VRAE(nn.Module):
                 f"Encoder tubelet and pooling group must compress time by 4, got {compression}"
             )
         decoder_value = dict(model_config["decoder"])
+        multiview = model_config.get("multiview", {})
+        if isinstance(multiview, Mapping):
+            for key in ("multiview_enabled", "num_views", "num_streams", "use_view_embedding", "use_view_attention"):
+                source = "enabled" if key == "multiview_enabled" else key
+                if source in multiview and key not in decoder_value:
+                    decoder_value[key] = multiview[source]
         decoder_value.setdefault("name", "vrae_decoder")
         init_mode = str(decoder_value.pop("init", "scratch"))
         init_checkpoint = decoder_value.pop("checkpoint", None)
         decoder_config = decoder_value.pop("parameters", decoder_value)
+        if isinstance(multiview, Mapping):
+            decoder_config = dict(decoder_config)
+            for key in ("multiview_enabled", "num_views", "num_streams", "use_view_embedding", "use_view_attention"):
+                source = "enabled" if key == "multiview_enabled" else key
+                if source in multiview and key not in decoder_config:
+                    decoder_config[key] = multiview[source]
         decoder = DECODERS.build(
             {"name": "vrae_decoder", **decoder_config}, input_dim=int(metadata["hidden_size"])
         )
@@ -105,10 +118,11 @@ class VRAE(nn.Module):
                 raise ValueError("decoder.init=raev2_image requires decoder.checkpoint")
             checkpoint_path = project_paths.checkpoint(init_checkpoint, require_exists=True)
             report = decoder.load_image_decoder_weights(_image_decoder_state(checkpoint_path))
-            if report["missing"] or report["unexpected"]:
+            missing = [key for key in report["missing"] if "view_embedding" not in key]
+            if missing or report["unexpected"]:
                 raise RuntimeError(
                     "Incomplete RAEv2 image decoder initialization from "
-                    f"{checkpoint_path}: missing={report['missing']} "
+                    f"{checkpoint_path}: missing={missing} "
                     f"unexpected={report['unexpected']}"
                 )
             decoder.initialization_report = report
@@ -117,7 +131,10 @@ class VRAE(nn.Module):
             raise ValueError(f"Unknown decoder initialization mode: {init_mode}")
         elif init_checkpoint is not None:
             raise ValueError("decoder.checkpoint is only valid with decoder.init=raev2_image")
-        return cls(encoder, pool, decoder)
+        instance = cls(encoder, pool, decoder)
+        if isinstance(data_config, Mapping) and isinstance(data_config.get("camera_keys"), list):
+            instance.multiview_camera_keys = [dict(item) if isinstance(item, Mapping) else {"key": str(item)} for item in data_config["camera_keys"]]
+        return instance
 
     def train(self, mode: bool = True) -> VRAE:
         super().train(mode)
@@ -129,16 +146,26 @@ class VRAE(nn.Module):
         self._validate_video(video)
         return self.encoder(video)
 
-    def encode(self, video: torch.Tensor) -> torch.Tensor:
+    def encode(self, video: torch.Tensor, stream_ids: torch.Tensor | None = None) -> torch.Tensor:
+        if getattr(self.decoder, "multiview_enabled", False):
+            if video.ndim != 6:
+                raise ValueError(f"Expected multiview video [B,T,V,3,H,W], got {tuple(video.shape)}")
+            batch, time, views, channels, height, width = video.shape
+            if channels != 3:
+                raise ValueError("Multiview video must have RGB channels")
+            flat = video.permute(0, 2, 1, 3, 4, 5).reshape(batch * views, time, channels, height, width)
+            latent = self.temporal_pool(self.encode_frames(flat))
+            _, chunks, latent_channels, latent_height, latent_width = latent.shape
+            return latent.reshape(batch, views, chunks, latent_channels, latent_height, latent_width).permute(0, 2, 1, 3, 4, 5).contiguous()
         features = self.encode_frames(video)
         return self.temporal_pool(features)
 
-    def decode(self, clean_latents: torch.Tensor) -> torch.Tensor:
-        return self.decoder(clean_latents)
+    def decode(self, clean_latents: torch.Tensor, stream_ids: torch.Tensor | None = None) -> torch.Tensor:
+        return self.decoder(clean_latents, stream_ids=stream_ids)
 
-    def forward(self, video: torch.Tensor) -> dict[str, torch.Tensor]:
-        clean_latents = self.encode(video)
-        return {"recon": self.decode(clean_latents), "latents": clean_latents}
+    def forward(self, video: torch.Tensor, stream_ids: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        clean_latents = self.encode(video, stream_ids=stream_ids)
+        return {"recon": self.decode(clean_latents, stream_ids=stream_ids), "latents": clean_latents}
 
     def trainable_groups(self) -> dict[str, nn.Module]:
         return {"temporal_pool": self.temporal_pool, "decoder": self.decoder}
@@ -169,6 +196,10 @@ class VRAE(nn.Module):
             "decoder_spatial_position_resize": "bicubic",
             "decoder_execution": self.decoder.execution_metadata(),
             "temporal_compression_ratio": self.temporal_compression_ratio,
+            "multiview_enabled": bool(getattr(self.decoder.config, "multiview_enabled", False)),
+            "num_views": int(getattr(self.decoder.config, "num_views", 1)),
+            "num_streams": int(getattr(self.decoder.config, "num_streams", 1)),
+            "camera_keys": list(self.multiview_camera_keys),
         }
 
     @staticmethod
