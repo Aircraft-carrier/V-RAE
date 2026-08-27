@@ -43,6 +43,7 @@ def main() -> None:
         ],
         multiview_enabled=True,
     )
+    assert isinstance(adapted, LeRobotDataset)
     clip = adapted[0]
     expected_vrae = {
         "video",
@@ -51,12 +52,17 @@ def main() -> None:
         "path",
         "frame_indices",
         "video_metadata",
+        "state",
+        "action",
+        "task",
         "stream_ids",
         "extra",
     }
     assert set(clip) == expected_vrae
     assert tuple(clip["video"].shape) == (8, 2, 3, 256, 256)
     assert tuple(clip["stream_ids"].tolist()) == (0, 1)
+    assert tuple(clip["state"].shape) == (8, 8)
+    assert tuple(clip["action"].shape) == (8, 7)
     print(f"native: {len(native)} frames, keys={sorted(item)}")
     print(f"adapted: {len(adapted)} episodes, video={tuple(clip['video'].shape)}")
     print(f"sample_id={clip['sample_id']} label={clip['label']} task={clip['extra']['task']}")

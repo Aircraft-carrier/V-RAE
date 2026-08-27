@@ -45,9 +45,6 @@ STAGE1_STRUCTURE_FIELDS = (
     "checkpoint_weight_source",
     "runtime_image_size",
     "runtime_grid_size",
-    "multiview_enabled",
-    "num_views",
-    "num_streams",
 )
 
 # The declared runtime geometry affects latent statistics and exact resume, but

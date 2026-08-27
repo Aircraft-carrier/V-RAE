@@ -13,7 +13,7 @@
 
 - `LeRobotVideoDataset`：从多个 camera key 读取一个 episode。
 - `VRAE`：在 encoder 前后处理 view 维。
-- `VRAEDecoder`：加入 view embedding，并在已有 attention 中支持 view token。
+- `VRAEDecoder`：仅将 view 维展平为 batch 维，复用原单视角 decoder；视角之间互不影响。
 - `VRAELatentAdapter`、`VRAEVideoDiT`：保留 view 维并联合处理 token。
 - `ReconstructionLoss`、GAN、训练循环：在现有入口增加 6D/多视角分支。
 
@@ -108,7 +108,7 @@ LeRobot row index 作为同步前提。若数据只有 timestamp，必须在 dat
 ### 4.1 `VRAE`
 
 `VRAE.from_config` 读取 `model.multiview`，只保存开关和尺寸，并把配置传给
-`VRAEDecoder`；view embedding 参数不在 `VRAE` 中重复创建。
+`VRAEDecoder`；Decoder 不创建 view embedding，也不执行跨视角 attention。
 
 `VRAE.encode(video, stream_ids=None)`：
 
@@ -126,27 +126,19 @@ return z.permute(0, 2, 1, 3, 4, 5).contiguous()
 encoder 和 temporal pool 不复制，单视角语句和 dtype 行为不变。
 
 `VRAE.decode(latents, stream_ids=None)` 在多视角时直接调用
-`VRAEDecoder.forward(latents, stream_ids=...)`，输出 `[B,T,V,3,H,W]`；关闭
-`use_view_attention` 时由 decoder 内部 reshape 为 `[B*V,L,C,H,W]`，复用原路径。
+`VRAEDecoder.forward(latents)` 接收 `[B,L,V,C,H,W]` 时内部 reshape 为
+`[B*V,L,C,H,W]`，复用原路径后恢复输出 `[B,T,V,3,H,W]`。
 
 ### 4.2 `VRAEDecoder`
 
-新增配置字段：`multiview_enabled`、`num_views`、`num_streams`、
-`use_view_embedding`、`use_view_attention`。原 5D `_forward_impl` 保持不变。
+原有 Decoder 配置保持不变；仅在 `forward` 增加 6D 输入的 reshape 分支，原 5D
+`_forward_impl` 保持不变。
 
 多视角分支：
 
-1. 输入 `[B,L,V,C,H,W]`，patchify 后组织为 `[B,L,V,H_p,W_p,D]`。
-2. `nn.Embedding(num_streams, D)` 查表，广播到每个 view 的全部时间/空间 patch；
-   embedding 零初始化。
-3. token 按 `[time, view, height, width]` 展平为 `[B,L*V*H_p*W_p,D]`。
-4. `DecoderAttention` 增加 `views` 参数，将 `tokens_per_chunk` 从
-   `H_p*W_p` 改为 `V*H_p*W_p`，继续使用现有 `chunk_prefix_attention`。
-5. 3D RoPE 位置 `(time,height,width)` 按 view 重复，不增加 view RoPE 轴。
-6. `depatchify` 按同一顺序恢复 `[B,T,V,3,H,W]`。
-
-view attention 关闭时，token 直接展平为 `B*V` 调用当前 5D decoder；因此可以先用
-“共享权重、无跨 view attention”做低显存基线，再打开联合 attention。
+1. 输入 `[B,L,V,C,H,W]` 转为 `[B*V,L,C,H,W]`。
+2. 调用原有 5D Decoder，不增加参数、不改变 attention token 数。
+3. 输出恢复为 `[B,T,V,3,H,W]`；每个 view 的 decode 完全独立。
 
 ## 5. Stage 1 loss、GAN 与训练入口
 
@@ -196,7 +188,7 @@ token 顺序固定为 `[time, view, patch]`，转换中不得丢弃或重排 V�
 多视角 forward：
 
 1. 接收 noisy `[B,L,V,N,C]`、`stream_ids=[B,V]`、`time=[B]`、task labels `[B]`。
-2. 在现有 encoder/decoder embedder 后加入各自的 zero-init view embedding。
+2. 在现有 encoder/decoder embedder 后加入各自的 zero-init view embedding（仅属于 DIT）。
 3. 保持 batch 维 B，把 token 展平为 `[B,L*V*N,C]`，复用现有 full self-attention；
    同一 episode 的各 view 因而可以互相看到。
 4. 位置表按 view 重复 `(time,height,width)`；不使用 view 轴 RoPE。
@@ -212,7 +204,7 @@ flow matching 时同一 episode 的各 view 使用相同 time，noise 独立采�
 使用 `training.init_from`，不作为 exact resume：
 
 1. 严格校验旧 encoder、pool、decoder/DiT 的 latent 定义和分辨率。
-2. 允许且只允许新增的 `view_embedding.*` 和多视角 attention 参数缺失。
+2. Stage 1 Decoder 不引入新增参数；DIT 的多视角参数按 DIT checkpoint 规则加载。
 3. 新参数零初始化，旧参数严格加载。
 4. 不迁移旧 optimizer、scheduler、sampler state 或 EMA。
 5. metadata 记录 `multiview_enabled`、`num_views`、`num_streams`、camera key/ID
@@ -233,7 +225,7 @@ flow matching 时同一 episode 的各 view 使用相同 time，noise 独立采�
 修改 src/vrae/data/lerobot.py                         # 多 camera key 与同步 item
 修改 src/vrae/training/recon_training/data.py        # dataset 分支、collate、搬运
 修改 src/vrae/models/autoencoder.py                  # VRAE 6D 分支
-修改 src/vrae/models/decoder.py                      # decoder view embedding/attention
+修改 src/vrae/models/decoder.py                      # 仅增加 6D -> B*V reshape 分支
 修改 src/vrae/models/adapter.py                      # VRAELatentAdapter 保留 V 维
 修改 src/vrae/models/dit/video_dit.py                # VideoDiT 5D token 分支
 修改 src/vrae/training/recon_training/losses.py      # ReconstructionLoss 6D 分支

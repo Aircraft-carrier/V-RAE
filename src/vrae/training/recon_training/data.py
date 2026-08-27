@@ -274,6 +274,11 @@ def collate_reconstruction(items: list[dict[str, Any]]) -> dict[str, Any]:
         stream_ids = torch.stack([item["stream_ids"] for item in items])
         if any(item["video"].ndim == 5 for item in items):
             batch["stream_ids"] = stream_ids
+    for key in ("state", "action"):
+        if key in items[0]:
+            batch[key] = torch.stack([item[key] for item in items])
+    if "task" in items[0]:
+        batch["task"] = [item["task"] for item in items]
     return batch
 
 

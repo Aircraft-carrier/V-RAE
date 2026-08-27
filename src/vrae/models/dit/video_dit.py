@@ -35,7 +35,11 @@ def _architecture_pair(
     scalar_second: int | None = None,
 ) -> tuple[int, int]:
     if isinstance(value, int):
-        result = (int(value), int(value) if scalar_second is None else int(scalar_second))
+        if scalar_second is None:
+            second = int(value)
+        else:
+            second = int(scalar_second)
+        result = (int(value), second)
     else:
         if len(value) != 2:
             raise ValueError(f"{name} must be an int or a length-2 sequence")
@@ -55,25 +59,74 @@ def _resolve_grid_size(
     result = as_pair(grid_size, "grid_size")
     if input_size is not None:
         alias = as_pair(input_size, "input_size")
-        if result != (16, 16) and result != alias:
+        if (
+            result != (16, 16)
+            and result != alias
+        ):
             raise ValueError("grid_size and input_size disagree")
         result = alias
     if height is not None or width is not None:
         if height is None or width is None:
             raise ValueError("height and width must be specified together")
         explicit = (int(height), int(width))
-        if result != (16, 16) and result != explicit:
+        if (
+            result != (16, 16)
+            and result != explicit
+        ):
             raise ValueError("grid_size and height/width disagree")
         result = as_pair(explicit, "height/width")
     return result
 
-
+# Shape notation used below:
+#   B = batch size
+#   T = number of temporal chunks (self.num_chunks)
+#   V = number of views (self.num_views)
+#   N = number of spatial tokens per chunk
+#   C = input channel count (self.in_channels)
+#   P = number of patches per chunk
+#   E = encoder hidden size
+#   D = decoder hidden size
+#   L = sequence length: T*P for single-view, T*V*P for multiview
+#
+# The diffusion or flow-matching transport supplies the noisy latent:
+#   single-view: noisy [B,T,N,C]
+#   multiview:   noisy [B,T,V,N,C]
+#
+# Overall data flow:
+#
+#   noisy
+#      │
+#      ├──► encoder patch embedding
+#      │         │
+#      │         ▼
+#      │      Encoder blocks
+#      │         │
+#      │         ├──► base_sequence
+#      │         │       └──► base_final_layer ──► base
+#      │         │
+#      │         └──► encoder final sequence
+#      │                    │
+#      │                    └──► encoder_to_decoder
+#      │                                  │
+#      └──► decoder patch embedding       ▼
+#                    │              decoder_condition
+#                    ▼                    │
+#                Decoder blocks ◄─────────┘
+#                    │
+#                    ▼
+#                final_layer ──► full
+#
+#   Possible outputs:
+#   full
+#   (full, base)
+#   (full, base_sequence)
+#   ((full, base), base_sequence)
 class VRAEVideoDiT(nn.Module):
     """Shared class-conditional video DDT for UCF101 and Kinetics-600.
 
-    Both input and output use the generation contract ``[B,T,H*W,C]``. Dataset
-    identity is intentionally absent: UCF101 and K600 differ only in
-    ``num_classes`` and configuration values.
+    Single-view inputs and outputs use ``[B,T,H*W,C]``. Multiview inputs and
+    outputs use ``[B,T,V,H*W,C]``. Dataset identity is intentionally absent:
+    UCF101 and K600 differ only in ``num_classes`` and configuration values.
     """
 
     def __init__(
@@ -110,19 +163,31 @@ class VRAEVideoDiT(nn.Module):
     ) -> None:
         super().__init__()
         if input_dim is not None:
-            if in_channels != 1024 and int(input_dim) != int(in_channels):
+            if (
+                in_channels != 1024
+                and int(input_dim) != int(in_channels)
+            ):
                 raise ValueError("input_dim and in_channels disagree")
             in_channels = int(input_dim)
         if num_frames is not None:
-            if num_chunks != 4 and int(num_frames) != int(num_chunks):
+            if (
+                num_chunks != 4
+                and int(num_frames) != int(num_chunks)
+            ):
                 raise ValueError("num_frames and num_chunks disagree")
             num_chunks = int(num_frames)
         if encoder_depth is not None:
-            if base_model_depth != 8 and int(encoder_depth) != int(base_model_depth):
+            if (
+                base_model_depth != 8
+                and int(encoder_depth) != int(base_model_depth)
+            ):
                 raise ValueError("encoder_depth and base_model_depth disagree")
             base_model_depth = int(encoder_depth)
         if condition_dropout is not None:
-            if class_dropout != 0.1 and float(condition_dropout) != float(class_dropout):
+            if (
+                class_dropout != 0.1
+                and float(condition_dropout) != float(class_dropout)
+            ):
                 raise ValueError("condition_dropout and class_dropout disagree")
             class_dropout = float(condition_dropout)
         if use_gradient_checkpointing is not None:
@@ -141,10 +206,14 @@ class VRAEVideoDiT(nn.Module):
         if self.in_channels <= 0:
             raise ValueError("in_channels must be positive")
         self.patch_size = as_pair(patch_size, "patch_size")
-        if any(size % patch for size, patch in zip(self.grid_size, self.patch_size, strict=True)):
+        if any(
+            size % patch
+            for size, patch in zip(self.grid_size, self.patch_size, strict=True)
+        ):
             raise ValueError("grid_size must be divisible by patch_size")
         self.patch_grid = tuple(
-            size // patch for size, patch in zip(self.grid_size, self.patch_size, strict=True)
+            size // patch
+            for size, patch in zip(self.grid_size, self.patch_size, strict=True)
         )
         self.tokens_per_chunk = self.grid_size[0] * self.grid_size[1]
         self.patches_per_chunk = self.patch_grid[0] * self.patch_grid[1]
@@ -153,7 +222,9 @@ class VRAEVideoDiT(nn.Module):
         enc_depth, dec_depth = _architecture_pair(depth, name="depth", scalar_second=2)
         enc_heads, dec_heads = _architecture_pair(num_heads, name="num_heads")
         if enc_dim % enc_heads or dec_dim % dec_heads:
-            raise ValueError("each hidden size must be divisible by its number of heads")
+            raise ValueError(
+                "each hidden size must be divisible by its number of heads"
+            )
         self.enc_hidden_size = enc_dim
         self.dec_hidden_size = dec_dim
         self.num_enc_blocks = enc_depth
@@ -171,7 +242,9 @@ class VRAEVideoDiT(nn.Module):
         self.num_streams = int(num_streams)
         self.use_view_embedding = bool(use_view_embedding)
         if self.num_views <= 0 or self.num_streams < self.num_views:
-            raise ValueError("num_views must be positive and no greater than num_streams")
+            raise ValueError(
+                "num_views must be positive and no greater than num_streams"
+            )
 
         self.encoder_embed = FramePatchEmbed(self.in_channels, enc_dim, self.patch_size)
         self.decoder_embed = FramePatchEmbed(self.in_channels, dec_dim, self.patch_size)
@@ -210,11 +283,20 @@ class VRAEVideoDiT(nn.Module):
             self.num_classes,
             dropout_prob=class_dropout,
         )
-        self.encoder_to_decoder: nn.Module = (
-            nn.Linear(enc_dim, dec_dim) if enc_dim != dec_dim else nn.Identity()
+        if enc_dim != dec_dim:
+            self.encoder_to_decoder: nn.Module = nn.Linear(enc_dim, dec_dim)
+        else:
+            self.encoder_to_decoder = nn.Identity()
+        self.final_layer = DDTFinalLayer(
+            dec_dim,
+            self.patch_size,
+            self.in_channels,
         )
-        self.final_layer = DDTFinalLayer(dec_dim, self.patch_size, self.in_channels)
-        self.base_final_layer = DDTFinalLayer(enc_dim, self.patch_size, self.in_channels)
+        self.base_final_layer = DDTFinalLayer(
+            enc_dim,
+            self.patch_size,
+            self.in_channels,
+        )
         self.encoder_view_embedding = nn.Embedding(self.num_streams, enc_dim)
         self.decoder_view_embedding = nn.Embedding(self.num_streams, dec_dim)
         nn.init.zeros_(self.encoder_view_embedding.weight)
@@ -257,7 +339,10 @@ class VRAEVideoDiT(nn.Module):
 
     @property
     def blocks(self) -> tuple[AdaLNZeroDDTBlock, ...]:
-        return tuple(self.encoder_blocks) + tuple(self.decoder_blocks)
+        return (
+            tuple(self.encoder_blocks)
+            + tuple(self.decoder_blocks)
+        )
 
     def set_gradient_checkpointing(self, enabled: bool = True) -> None:
         self.gradient_checkpointing = bool(enabled)
@@ -280,7 +365,11 @@ class VRAEVideoDiT(nn.Module):
         positions: torch.Tensor,
         rope_cache: VideoDiTRoPECache,
     ) -> torch.Tensor:
-        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+        if (
+            self.gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        ):
             return checkpoint(
                 lambda current, cond: block(
                     current,
@@ -292,7 +381,12 @@ class VRAEVideoDiT(nn.Module):
                 condition,
                 use_reentrant=False,
             )
-        return block(value, condition, positions, rope_cache=rope_cache)
+        return block(
+            value,
+            condition,
+            positions,
+            rope_cache=rope_cache,
+        )
 
     def _cached_rope(
         self,
@@ -303,7 +397,9 @@ class VRAEVideoDiT(nn.Module):
         block: AdaLNZeroDDTBlock,
     ) -> VideoDiTRoPECache:
         if positions.device != hidden.device:
-            raise ValueError("VideoDiT positions and hidden states must be on the same device")
+            raise ValueError(
+                "VideoDiT positions and hidden states must be on the same device"
+            )
         attribute = f"_{scope}_rope_cache"
         cached = getattr(self, attribute)
         head_dim = block.attn.head_dim
@@ -357,20 +453,83 @@ class VRAEVideoDiT(nn.Module):
             raise ValueError("class labels are required")
         if condition_drop_mask is not None and class_drop_mask is not None:
             raise ValueError("pass only one of condition_drop_mask or class_drop_mask")
-        drop_mask = class_drop_mask if class_drop_mask is not None else condition_drop_mask
-
+        if class_drop_mask is not None:
+            drop_mask = class_drop_mask
+        else:
+            drop_mask = condition_drop_mask
+        # Shape notation:
+        #   B = batch size
+        #   T = self.num_chunks (temporal chunks)
+        #   V = self.num_views (views)
+        #   H,W = self.grid_size
+        #   C = self.in_channels
+        #   N = H*W (input spatial tokens)
         multiview = self.multiview_enabled
         if multiview:
-            if noisy.ndim != 5 or tuple(noisy.shape[1:3]) != (self.num_chunks, self.num_views):
-                raise ValueError(f"noisy must have shape [B,{self.num_chunks},{self.num_views},N,C]")
+            # Multiview inputs follow the [B,T,V,N,C] layout.
+            if (
+                noisy.ndim != 5
+                or tuple(noisy.shape[1:3]) != (self.num_chunks, self.num_views)
+            ):
+                raise ValueError(
+                    f"noisy must have shape [B,{self.num_chunks},{self.num_views},N,C]"
+                )
+
             batch = noisy.shape[0]
             expected_tokens = self.grid_size[0] * self.grid_size[1]
-            if tuple(noisy.shape[3:]) != (expected_tokens, self.in_channels):
+
+            # Check the spatial token count N and channel count C.
+            if tuple(noisy.shape[3:]) != (
+                expected_tokens,
+                self.in_channels,
+            ):
                 raise ValueError("noisy token grid has incorrect patch shape")
-            grid = noisy.reshape(batch * self.num_views, self.num_chunks, expected_tokens, self.in_channels)
-            grid = grid.reshape(batch * self.num_views, self.num_chunks, self.grid_size[0], self.grid_size[1], self.in_channels)
-            grid = grid.permute(0, 1, 4, 2, 3).reshape(batch * self.num_views * self.num_chunks, self.in_channels, *self.grid_size)
+
+            # Treat each view as an independent sample for the frame patch embedder.
+            #
+            # Intended shape change:
+            #   [B,T,V,N,C] -> [B*V,T,N,C]
+            #
+            # The input is [B,T,V,N,C]. Move V before T before merging B and V;
+            # a direct reshape would interleave temporal chunks and views.
+            grid = (
+                noisy.permute(0, 2, 1, 3, 4)
+                .contiguous()
+                .reshape(
+                    batch * self.num_views,
+                    self.num_chunks,
+                    expected_tokens,
+                    self.in_channels,
+                )
+            )
+
+            # Restore the flattened N=H*W tokens to a 2D spatial grid:
+            #   [B*V,T,N,C] -> [B*V,T,H,W,C]
+            grid = grid.reshape(
+                batch * self.num_views,
+                self.num_chunks,
+                self.grid_size[0],
+                self.grid_size[1],
+                self.in_channels,
+            )
+
+            # Move channels to the standard PyTorch image-tensor position:
+            #   [B*V,T,H,W,C] -> [B*V,T,C,H,W]
+            #
+            # Then merge temporal chunks into the batch dimension:
+            #   [B*V,T,C,H,W] -> [B*V*T,C,H,W]
+            grid = (
+                grid.permute(0, 1, 4, 2, 3)
+                .reshape(
+                    batch * self.num_views * self.num_chunks,
+                    self.in_channels,
+                    *self.grid_size,
+                )
+            )
         else:
+            # The helper validates and converts the single-view layout:
+            #   noisy [B,T,H*W,C]
+            #       -> grid [B*T,C,H,W]
             grid, batch = video_tokens_to_grid(
                 noisy,
                 chunks=self.num_chunks,
@@ -378,50 +537,135 @@ class VRAEVideoDiT(nn.Module):
                 channels=self.in_channels,
                 name="noisy",
             )
+        # `time` may be a scalar or one value per batch element.
+        # A scalar with shape [] is expanded to [B].
         if time.ndim == 0:
             time = time.expand(batch)
         if time.ndim != 1 or time.shape[0] != batch:
             raise ValueError(f"time must have shape [{batch}], got {tuple(time.shape)}")
         if labels.shape != (batch,):
-            raise ValueError(f"labels must have shape [{batch}], got {tuple(labels.shape)}")
+            raise ValueError(
+                f"labels must have shape [{batch}], got {tuple(labels.shape)}"
+            )
         if multiview:
+            # If stream IDs are omitted, use 0,1,...,V-1 by default.
             if stream_ids is None:
-                stream_ids = torch.arange(self.num_views, device=noisy.device).expand(batch, self.num_views)
+                stream_ids = torch.arange(
+                    self.num_views,
+                    device=noisy.device,
+                ).expand(batch, self.num_views)
             if stream_ids.shape != (batch, self.num_views):
-                raise ValueError(f"stream_ids must have shape [{batch},{self.num_views}]")
+                raise ValueError(
+                    f"stream_ids must have shape [{batch},{self.num_views}]"
+                )
+            # Stream IDs must be valid embedding indices.
             if stream_ids.min() < 0 or stream_ids.max() >= self.num_streams:
                 raise ValueError("stream_ids are outside num_streams")
+        # Move time to the input device. The embedding has shape [B,E], where
+        # E is self.enc_hidden_size.
         time_embedding = self.time_embedder(time.to(noisy.device))
+        # `prepare` applies label dropout and returns the label embedding.
+        # The other two return values are not needed here.
         label_embedding, _, _ = self.condition_adapter.prepare(
             labels,
             drop_mask=drop_mask,
             generator=condition_generator,
         )
-        encoder_condition = time_embedding + label_embedding.to(time_embedding.dtype)
+        # Match the label embedding dtype to the time embedding before adding:
+        #   time_embedding  [B,E]
+        #   label_embedding [B,E]
+        #   encoder_condition [B,E]
+        encoder_condition = time_embedding + label_embedding.to(
+            time_embedding.dtype
+        )
+        # Convert the frame grid into a token sequence with the encoder embedder.
+        #
+        # Single-view:
+        #   grid [B*T,C,H,W]
+        #   -> sequence [B,T*P,E]
+        #
+        # Multiview:
+        #   grid [B*V*T,C,H,W]
+        #   -> sequence [B*V,T*P,E]
+        #
+        # P = patches per temporal chunk; E = encoder hidden size.
+        if multiview:
+            embed_batch_size = batch * self.num_views
+        else:
+            embed_batch_size = batch
         sequence = embed_video_frames(
             self.encoder_embed,
             grid,
-            batch_size=batch * self.num_views if multiview else batch,
+            batch_size=embed_batch_size,
             chunks=self.num_chunks,
         )
         if multiview:
             patches = sequence.shape[1] // self.num_chunks
-            sequence = sequence.reshape(batch, self.num_views, self.num_chunks, patches, sequence.shape[-1]).permute(0, 2, 3, 1, 4)
+
+            # Split out the view and temporal-chunk dimensions:
+            #   [B*V,T*P,E]
+            #   -> [B,V,T,P,E]
+            sequence = sequence.reshape(
+                batch,
+                self.num_views,
+                self.num_chunks,
+                patches,
+                sequence.shape[-1],
+            )
+
+            # Reorder to [B,T,V,P,E], grouping views within each chunk.
+            sequence = sequence.permute(0, 2, 1, 3, 4)
+
             if self.use_view_embedding:
                 ids = stream_ids
-                sequence = sequence + self.encoder_view_embedding(ids).to(sequence.dtype)[:, None, None]
-            sequence = sequence.reshape(batch, -1, sequence.shape[-1])
-            encoder_positions = self._encoder_positions.repeat_interleave(self.num_views, dim=0)
+
+                # self.encoder_view_embedding(ids):
+                #   ids [B,V] -> embedding [B,V,E]
+                #
+                # After adding singleton dimensions:
+                #   [B,V,E] -> [B,1,V,1,E]
+                #
+                # This broadcasts over every token in [B,T,V,P,E].
+                sequence = sequence + (
+                    self.encoder_view_embedding(ids)
+                    .to(sequence.dtype)[:, None, :, None]
+                )
+
+            # Transformers consume a two-dimensional sequence:
+            #   [B,T,V,P,E] -> [B,T*V*P,E]
+            #
+            # For example, T=2, V=2, P=3 gives a sequence length of 12.
+            sequence = sequence.reshape(
+                batch,
+                -1,
+                sequence.shape[-1],
+            )
+
+            # Build 3D position coordinates for each token. The base positions
+            # have shape [T,P,3] and become [T,V,P,3] after view expansion.
+            # Flattening gives [T*V*P,3] in the same order as the sequence.
+            encoder_positions = (
+                self._encoder_positions
+                .reshape(self.num_chunks, patches, 3)[:, None]
+                .expand(-1, self.num_views, -1, -1)
+                .reshape(-1, 3)
+            )
+
         else:
+            # In single-view mode, the number of positions is T*P.
             encoder_positions = self._encoder_positions
+
         encoder_rope_cache = self._cached_rope(
             scope="encoder",
             positions=encoder_positions,
             hidden=sequence,
             block=self.encoder_blocks[0],
         )
+        # Save the encoder activation at base_model_depth for the base branch.
         base_sequence: torch.Tensor | None = None
         for index, block in enumerate(self.encoder_blocks, start=1):
+            # The sequence remains [B,L,E], where L is T*P in single-view mode
+            # and T*V*P in multiview mode.
             sequence = self._run_conditioned_block(
                 block,
                 sequence,
@@ -434,23 +678,68 @@ class VRAEVideoDiT(nn.Module):
         if base_sequence is None:
             raise RuntimeError("base encoder activation was not captured")
 
-        decoder_condition = self.encoder_to_decoder(F.silu(time_embedding + sequence))
+        # `sequence` is now the final encoder output [B,L,E]. The time embedding
+        # [B,E] broadcasts across the token dimension:
+        #
+        #   [B,E] + [B,L,E] -> [B,L,E]
+        #
+        # Apply SiLU, then project from E to D to form the decoder condition.
+        decoder_condition = self.encoder_to_decoder(
+            F.silu(time_embedding + sequence)
+        )
+        # decoder_condition: [B,L,D], where D is the decoder hidden size.
+
+        # The decoder uses its own patch embedder on the same grid rather than
+        # reusing the encoder tokens.
         decoder_sequence = embed_video_frames(
             self.decoder_embed,
             grid,
-            batch_size=batch * self.num_views if multiview else batch,
+            batch_size=embed_batch_size,
             chunks=self.num_chunks,
         )
+
         if multiview:
             patches = decoder_sequence.shape[1] // self.num_chunks
-            decoder_sequence = decoder_sequence.reshape(batch, self.num_views, self.num_chunks, patches, decoder_sequence.shape[-1]).permute(0, 2, 3, 1, 4)
+
+            # [B*V,T*P,D] -> [B,V,T,P,D]
+            decoder_sequence = decoder_sequence.reshape(
+                batch,
+                self.num_views,
+                self.num_chunks,
+                patches,
+                decoder_sequence.shape[-1],
+            )
+
+            # Reorder to [B,T,V,P,D].
+            decoder_sequence = decoder_sequence.permute(0, 2, 1, 3, 4)
+
             if self.use_view_embedding:
                 ids = stream_ids
-                decoder_sequence = decoder_sequence + self.decoder_view_embedding(ids).to(decoder_sequence.dtype)[:, None, None]
-            decoder_sequence = decoder_sequence.reshape(batch, -1, decoder_sequence.shape[-1])
-            decoder_positions = self._decoder_positions.repeat_interleave(self.num_views, dim=0)
+
+                # [B,V,D] -> [B,1,V,1,D], then broadcast over chunks and patches.
+                decoder_sequence = decoder_sequence + (
+                    self.decoder_view_embedding(ids)
+                    .to(decoder_sequence.dtype)[:, None, :, None]
+                )
+
+            # [B,T,V,P,D] -> [B,T*V*P,D]
+            decoder_sequence = decoder_sequence.reshape(
+                batch,
+                -1,
+                decoder_sequence.shape[-1],
+            )
+
+            # The decoder uses its own position-encoding cache.
+            decoder_positions = (
+                self._decoder_positions
+                .reshape(self.num_chunks, patches, 3)[:, None]
+                .expand(-1, self.num_views, -1, -1)
+                .reshape(-1, 3)
+            )
+
         else:
             decoder_positions = self._decoder_positions
+
         decoder_rope_cache = self._cached_rope(
             scope="decoder",
             positions=decoder_positions,
@@ -469,24 +758,60 @@ class VRAEVideoDiT(nn.Module):
         base_condition = F.silu(time_embedding + base_sequence)
         base_tokens = self.base_final_layer(base_condition, base_condition)
         if multiview:
+
             def restore(tokens: torch.Tensor) -> torch.Tensor:
-                tokens = tokens.reshape(batch, self.num_chunks, self.num_views, self.patches_per_chunk, -1)
-                tokens = tokens.permute(0, 2, 1, 3, 4).reshape(batch * self.num_views, self.num_chunks * self.patches_per_chunk, -1)
+                tokens = tokens.reshape(
+                    batch,
+                    self.num_chunks,
+                    self.num_views,
+                    self.patches_per_chunk,
+                    -1,
+                )
+                tokens = tokens.permute(
+                    0,
+                    2,
+                    1,
+                    3,
+                    4,
+                ).reshape(
+                    batch * self.num_views,
+                    self.num_chunks * self.patches_per_chunk,
+                    -1,
+                )
                 restored = self._unpatchify(tokens, batch_size=batch * self.num_views)
-                return restored.reshape(batch, self.num_views, self.num_chunks, self.patches_per_chunk, -1).permute(0, 2, 1, 3, 4).contiguous()
+                restored = restored.reshape(
+                    batch,
+                    self.num_views,
+                    self.num_chunks,
+                    self.patches_per_chunk,
+                    -1,
+                )
+                return restored.permute(
+                    0,
+                    2,
+                    1,
+                    3,
+                    4,
+                ).contiguous()
             full = restore(full_tokens)
             base = restore(base_tokens)
         else:
             full = self._unpatchify(full_tokens, batch_size=batch)
             base = self._unpatchify(base_tokens, batch_size=batch)
         result: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-        result = (full, base) if return_base else full
+        if return_base:
+            result = (full, base)
+        else:
+            result = full
         if return_intermediate:
             return result, base_sequence
         return result
 
 
-def _factory_parameters(config: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+def _factory_parameters(
+    config: Mapping[str, Any],
+    overrides: Mapping[str, Any],
+) -> dict[str, Any]:
     values = dict(config)
     values.pop("name", None)
     nested = values.pop("parameters", values.pop("params", {}))
@@ -507,7 +832,8 @@ def build_vrae_video_dit(
     config: Mapping[str, Any],
     **overrides: Any,
 ) -> VRAEVideoDiT:
-    return VRAEVideoDiT(**_factory_parameters(config, overrides))
+    parameters = _factory_parameters(config, overrides)
+    return VRAEVideoDiT(**parameters)
 
 
 __all__ = ["VRAEVideoDiT", "build_vrae_video_dit"]

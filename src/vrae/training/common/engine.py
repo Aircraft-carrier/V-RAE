@@ -241,6 +241,24 @@ class ClassConditionalVideoDataset:
         from vrae.data.transforms import random_crop_video, resize_short_side
 
         data = config["data"]
+        if dataset_name == "lerobot":
+            from vrae.data.lerobot import LeRobotVideoDataset
+
+            multiview = config.get("model", {}).get("multiview", {})
+            root_value = data.get("root")
+            root = Path(str(root_value)).expanduser() if root_value else paths.dataset("lerobot")
+            return LeRobotVideoDataset(
+                root,
+                repo_id=str(data.get("repo_id", "libero")),
+                clip_length=int(data["num_frames"]),
+                frame_interval=int(data.get("frame_interval", 1)),
+                sampling=str(data.get("sampling", "random")),
+                base_seed=int(data.get("seed", 3407)),
+                camera_keys=data.get("camera_keys"),
+                image_size=int(data["image_size"]) if data.get("image_size") is not None else None,
+                random_flip=bool(data.get("random_flip", False)),
+                multiview_enabled=bool(multiview.get("enabled", True)),
+            )
         runtime = config.get("runtime", {})
         if not isinstance(runtime, Mapping):
             raise TypeError("runtime configuration must be a mapping")
@@ -521,7 +539,10 @@ def compute_class_conditional_latent_stats(
                 video = batch["video"].to(context.device, non_blocking=True)
                 if video.dtype == torch.uint8:
                     video = video.float().div_(255.0)
-                stats.update(stage1.encode_grid(video))
+                stream_ids = batch.get("stream_ids")
+                if stream_ids is not None:
+                    stream_ids = stream_ids.to(context.device, non_blocking=True)
+                stats.update(stage1.encode_grid(video, stream_ids=stream_ids))
                 progress.update(1)
     finally:
         progress.close()
@@ -609,6 +630,12 @@ def build_class_conditional_dit(
     patch = int(stage1_metadata["patch_size"])
     grid = (int(image_size[0]) // patch, int(image_size[1]) // patch)
     dit_config = dict(config["dit"])
+    multiview = config.get("model", {}).get("multiview", {})
+    if isinstance(multiview, Mapping):
+        dit_config.setdefault("multiview_enabled", bool(multiview.get("enabled", False)))
+        for key in ("num_views", "num_streams", "use_view_embedding"):
+            if key in multiview:
+                dit_config.setdefault(key, multiview[key])
     dit_config.pop("input_dim", None)
     return DIT_MODELS.build(
         dit_config,
@@ -637,6 +664,9 @@ def class_conditional_metadata(
         "dit_num_chunks": int(dit.num_chunks),
         "dit_grid_size": list(dit.grid_size),
         "dit_num_classes": int(dit.num_classes),
+        "dit_multiview_enabled": bool(getattr(dit, "multiview_enabled", False)),
+        "dit_num_views": int(getattr(dit, "num_views", 1)),
+        "dit_num_streams": int(getattr(dit, "num_streams", 1)),
         **dit_architecture_metadata(dit),
         "transport": flow_transport_metadata(config),
         "latent_normalizer_identity": (
@@ -886,10 +916,13 @@ def train_class_conditional(
             if video.dtype == torch.uint8:
                 video = video.float().div_(255.0)
             labels = batch["label"].to(context.device, non_blocking=True)
+            stream_ids = batch.get("stream_ids")
+            if stream_ids is not None:
+                stream_ids = stream_ids.to(context.device, non_blocking=True)
             if context.device.type == "cuda":
                 transfer_finished.record()
             with torch.no_grad():
-                grid = stage1.encode_grid(video)
+                grid = stage1.encode_grid(video, stream_ids=stream_ids)
                 clean = normalizer.normalize(stage1.grid_to_tokens(grid))
             if context.device.type == "cuda":
                 stage1_finished.record()
@@ -898,7 +931,7 @@ def train_class_conditional(
                     losses = transport.training_losses(
                         model,
                         clean,
-                        model_kwargs={"labels": labels},
+                        model_kwargs={"labels": labels, **({"stream_ids": stream_ids} if stream_ids is not None else {})},
                     )
                     loss = losses["loss"]
                 accumulation.backward(loss, scaler)

@@ -37,11 +37,6 @@ class DecoderConfig:
     attention_backend: str = "auto"
     rope_theta: float = 10_000.0
     gradient_checkpointing: bool = False
-    multiview_enabled: bool = False
-    num_views: int = 1
-    num_streams: int = 1
-    use_view_embedding: bool = True
-    use_view_attention: bool = True
 
     @classmethod
     def from_mapping(
@@ -70,8 +65,6 @@ class DecoderConfig:
             raise ValueError("hidden_size must be divisible by num_heads")
         if len(self.image_size) != 2 or any(size % self.patch_size for size in self.image_size):
             raise ValueError("Both image dimensions must be divisible by patch_size")
-        if self.num_views <= 0 or self.num_streams <= 0 or self.num_views > self.num_streams:
-            raise ValueError("num_views must be positive and no greater than num_streams")
 
 
 def _fa3_training() -> Callable[..., Any]:
@@ -247,7 +240,6 @@ class DecoderAttention(nn.Module):
         width: int,
         rope_cosine: torch.Tensor,
         rope_sine: torch.Tensor,
-        views: int = 1,
     ) -> torch.Tensor:
         batch, tokens, channels = x.shape
         heads = self.config.num_heads
@@ -277,7 +269,7 @@ class DecoderAttention(nn.Module):
                 key,
                 value,
                 num_chunks=chunks,
-                tokens_per_chunk=views * height * width,
+                tokens_per_chunk=height * width,
                 backend=backend,
                 dropout_p=dropout,
             )
@@ -314,14 +306,12 @@ class DecoderBlock(nn.Module):
         width: int,
         rope_cosine: torch.Tensor,
         rope_sine: torch.Tensor,
-        views: int = 1,
     ) -> torch.Tensor:
         x = x + self.attention(
             self.norm1(x),
             chunks=chunks,
             height=height,
             width=width,
-            views=views,
             rope_cosine=rope_cosine,
             rope_sine=rope_sine,
         )
@@ -357,9 +347,6 @@ class VRAEDecoder(nn.Module):
         output_dim = config.tubelet_size * config.patch_size**2 * config.num_channels
         self.prediction = nn.Linear(config.hidden_size, output_dim)
         self.gradient_checkpointing = bool(config.gradient_checkpointing)
-        self.multiview_enabled = bool(config.multiview_enabled)
-        self.view_embedding = nn.Embedding(config.num_streams, config.hidden_size)
-        nn.init.zeros_(self.view_embedding.weight)
         self._compiled_forward: Callable[[torch.Tensor], torch.Tensor] | None = None
         self.register_buffer("_rope_cosine", torch.empty(0), persistent=False)
         self.register_buffer("_rope_sine", torch.empty(0), persistent=False)
@@ -472,47 +459,21 @@ class VRAEDecoder(nn.Module):
         predicted = self.prediction(self.norm(hidden))
         return self.depatchify(predicted, chunks=chunks, height=height, width=width)
 
-    def _forward_multiview(self, latents: torch.Tensor, stream_ids: torch.Tensor | None) -> torch.Tensor:
-        if latents.ndim != 6:
-            raise ValueError(f"Expected [B,Tlatent,V,C,H,W], got {tuple(latents.shape)}")
-        batch, chunks, views, channels, height, width = latents.shape
-        if views != self.config.num_views:
-            raise ValueError(f"Expected {self.config.num_views} views, got {views}")
-        if channels != self.config.input_dim:
-            raise ValueError(f"Expected {self.config.input_dim} latent channels, got {channels}")
-        if stream_ids is None:
-            stream_ids = torch.arange(views, device=latents.device).expand(batch, views)
-        if stream_ids.shape != (batch, views):
-            raise ValueError(f"stream_ids must have shape [{batch},{views}], got {tuple(stream_ids.shape)}")
-        if stream_ids.min() < 0 or stream_ids.max() >= self.config.num_streams:
-            raise ValueError("stream_ids are outside the configured num_streams")
-        if not self.config.use_view_attention:
-            flattened = latents.permute(0, 2, 1, 3, 4, 5).reshape(batch * views, chunks, channels, height, width)
-            output = self._forward_impl(flattened)
-            return output.reshape(batch, views, output.shape[1], output.shape[2], output.shape[3], output.shape[4]).permute(0, 2, 1, 3, 4, 5).contiguous()
-        hidden = latents.permute(0, 1, 2, 4, 5, 3).reshape(batch, chunks * views * height * width, channels)
-        hidden = self.input_projection(hidden)
-        position = self._position(height, width, hidden).reshape(1, 1, height * width, -1)
-        hidden = hidden.reshape(batch, chunks, views, height * width, -1)
-        hidden = hidden + position[:, None, None]
-        if self.config.use_view_embedding:
-            hidden = hidden + self.view_embedding(stream_ids).to(hidden.dtype)[:, None, :, None]
-        hidden = hidden.reshape(batch, chunks * views * height * width, -1)
-        rope_cosine, rope_sine = self._rope_cache(chunks, height, width, hidden[:, : chunks * height * width])
-        rope_cosine = rope_cosine.repeat_interleave(views, dim=0)
-        rope_sine = rope_sine.repeat_interleave(views, dim=0)
-        for block in self.blocks:
-            hidden = block(hidden, chunks, height, width, rope_cosine, rope_sine, views)
-        predicted = self.prediction(self.norm(hidden)).reshape(batch, chunks, views, height * width, -1)
-        predicted = predicted.permute(0, 2, 1, 3, 4).reshape(batch * views, chunks * height * width, -1)
-        output = self.depatchify(predicted, chunks=chunks, height=height, width=width)
-        return output.reshape(batch, views, output.shape[1], output.shape[2], output.shape[3], output.shape[4]).permute(0, 2, 1, 3, 4, 5).contiguous()
-
-    def forward(self, latents: torch.Tensor, *, stream_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        if latents.ndim == 6:
+            batch, chunks, views, channels, height, width = latents.shape
+            flattened = latents.permute(0, 2, 1, 3, 4, 5).reshape(
+                batch * views, chunks, channels, height, width
+            )
+            decode_fn = self._compiled_forward or self._forward_impl
+            decoded = decode_fn(flattened)
+            return decoded.reshape(
+                batch, views, decoded.shape[1], decoded.shape[2], decoded.shape[3], decoded.shape[4]
+            ).permute(0, 2, 1, 3, 4, 5).contiguous()
         return (
             self._compiled_forward(latents)
             if self._compiled_forward is not None
-            else self._forward_multiview(latents, stream_ids) if self.multiview_enabled else self._forward_impl(latents)
+            else self._forward_impl(latents)
         )
 
     def execution_metadata(self) -> dict[str, Any]:

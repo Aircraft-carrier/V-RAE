@@ -28,7 +28,7 @@ class LatentNormalizer(nn.Module):
 
     def _view(self, value: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
         if latents.ndim == 5:
-            shape = (1, 1, -1, 1, 1)
+            shape = (1, 1, 1, 1, -1) if latents.shape[-1] == self.mean.numel() else (1, 1, -1, 1, 1)
         elif latents.ndim == 4:
             shape = (1, 1, 1, -1)
         else:
@@ -78,8 +78,13 @@ class DistributedLatentStats:
     def update(self, clean_latents: torch.Tensor) -> None:
         if self._reduced:
             raise RuntimeError("Cannot update statistics after distributed reduction")
-        if clean_latents.ndim == 5:
-            values = clean_latents.permute(0, 1, 3, 4, 2).reshape(-1, self.channels)
+        if clean_latents.ndim == 6:
+            values = clean_latents.permute(0, 1, 2, 4, 5, 3).reshape(-1, self.channels)
+        elif clean_latents.ndim == 5:
+            if clean_latents.shape[-1] == self.channels:
+                values = clean_latents.reshape(-1, self.channels)
+            else:
+                values = clean_latents.permute(0, 1, 3, 4, 2).reshape(-1, self.channels)
         elif clean_latents.ndim == 4:
             values = clean_latents.reshape(-1, self.channels)
         else:

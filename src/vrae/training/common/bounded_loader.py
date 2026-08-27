@@ -264,16 +264,19 @@ class BoundedThreadBatchLoader:
         if not items:
             raise RuntimeError("Cannot collate an empty video batch")
         expected_shape = tuple(items[0]["video"].shape)
+        video_dtype = items[0]["video"].dtype
+        if video_dtype not in {torch.uint8, torch.float32}:
+            raise RuntimeError(f"Unsupported CPU clip dtype: {video_dtype}")
         video = torch.empty(
             (len(items), *expected_shape),
-            dtype=torch.uint8,
+            dtype=video_dtype,
             device="cpu",
             pin_memory=self.pin_memory,
         )
         for index, item in enumerate(items):
             sample = item["video"]
-            if sample.dtype != torch.uint8 or sample.device.type != "cpu":
-                raise RuntimeError("Bounded CPU loader requires CPU uint8 clips")
+            if sample.dtype != video_dtype or sample.device.type != "cpu":
+                raise RuntimeError("Bounded CPU loader requires uniform CPU clip dtype")
             if tuple(sample.shape) != expected_shape:
                 raise RuntimeError(
                     f"Inconsistent decoded clip shape: {tuple(sample.shape)} != {expected_shape}"
@@ -285,7 +288,7 @@ class BoundedThreadBatchLoader:
                 "Decoded batch exceeded the configured attempt limit: "
                 f"{sum(decode_attempts)} > {self.max_decode_attempts_per_batch}"
             )
-        return {
+        batch = {
             "video": video,
             "label": torch.tensor([int(item["label"]) for item in items], dtype=torch.long),
             "sample_id": [str(item["sample_id"]) for item in items],
@@ -293,9 +296,17 @@ class BoundedThreadBatchLoader:
                 decode_attempts,
                 dtype=torch.long,
             ),
-            "_video_normalized": False,
+            "_video_normalized": torch.is_floating_point(video),
             "_video_pinned": bool(video.is_pinned()),
         }
+        if "stream_ids" in items[0]:
+            batch["stream_ids"] = torch.stack([item["stream_ids"] for item in items])
+        for key in ("state", "action"):
+            if key in items[0]:
+                batch[key] = torch.stack([item[key] for item in items])
+        if "task" in items[0]:
+            batch["task"] = [item["task"] for item in items]
+        return batch
 
     def _iterate(self) -> Iterator[dict[str, Any]]:
         batch_indices = iter(self.sampler)
