@@ -1,5 +1,5 @@
 project_root: path/to/V-RAE
 datasets:
-  lerobot: path/to/LeRobot/dataset
+  lerobot: /zsh/cache/data/Lerobot/libero
 third_party:
   vjepa2_1: path/to/V-RAE/third_party/vjepa2

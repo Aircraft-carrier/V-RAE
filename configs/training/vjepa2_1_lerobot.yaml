@@ -1,16 +1,19 @@
-include: ../models/vrae_vjepa2_1_l_k7.yaml
+include:
+  - ../models/vrae_vjepa2_1_l_k7.yaml
+  - ../data/libero.yaml
 task: recon_training
-run_name: vjepa2_1_lerobot
+run_name: vjepa2_1_libero_reconstruction
 model:
   decoder:
     init: scratch
+    attention_mode: full
     attention_mode: full
 training:
   init_from: null
   resume: null
   epochs: 50
   checkpoint_interval: 1000
-  global_batch_size: 128
+  global_batch_size: 32
   gradient_accumulation_steps: 1
   precision: bf16
   num_workers: 4
@@ -28,18 +31,6 @@ training:
     apply_in_eval: false
   ema:
     decay: 0.9995
-data:
-  dataset: lerobot
-  root: null
-  repo_id: your-org/your-lerobot-dataset
-  camera_keys:
-    - {key: observation.images.image, name: camera, stream_id: 0}
-  num_frames: 16
-  frame_interval: 1
-  sampling: random
-  image_size: 256
-  random_flip: false
-  seed: 3407
 loss:
   l1: 1.0
   lpips: 1.0
@@ -51,8 +42,8 @@ loss:
   calibration_checkpoint: ckpts/pretrained/perceptual/lpips_vgg.pt
 wandb:
   project: V-RAE
-  group: reconstruction
-  tags: [reconstruction, vjepa2_1]
+  group: libero_reconstruction
+  tags: [libero, reconstruction, vjepa2_1, multiview]
   mode: online
   resume: allow
   log_interval: 20

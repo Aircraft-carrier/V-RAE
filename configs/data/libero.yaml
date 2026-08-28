@@ -1,0 +1,30 @@
+model:
+  multiview:
+    enabled: true
+    num_views: 2
+    num_streams: 2
+    use_view_embedding: true
+data:
+  dataset: lerobot
+  root: /zsh/cache/data/Lerobot/libero
+  repo_id: libero
+  split: train
+  camera_keys:
+    - {key: observation.images.image, name: head, stream_id: 0}
+    - {key: observation.images.image2, name: wrist, stream_id: 1}
+  class_suites:
+    - name: libero_10
+      task_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    - name: libero_goal
+      task_indices: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    - name: libero_object
+      task_indices: [20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+    - name: libero_spatial
+      task_indices: [30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
+  num_frames: 16
+  frame_interval: 1
+  sampling: random
+  image_size: 256
+  random_flip: false
+  fps: 10
+  seed: 3407

@@ -1,10 +1,10 @@
-# V-RAE — V-JEPA 2.1 + LeRobot 最小训练版
+# V-RAE — V-JEPA 2.1 + LIBERO 训练
 
-本分支只保留 V-JEPA 2.1 冻结编码器上的 V-RAE Stage 1 重建训练：训练 temporal pool 和 video decoder，编码器参数始终冻结。数据集统一使用 LeRobot，训练配置只有一个模板。
+本分支提供两阶段训练：先在 LIBERO LeRobot 数据上训练 V-RAE 重建模型，再冻结 V-RAE、以 40 个 `suite/task` 为类别训练 class-conditional VideoDiT。默认同时使用 head 和 wrist 两个同步相机。
 
 ## 安装
 
-需要 Linux、NVIDIA GPU、Python 3.10+、CUDA 和 FFmpeg。LeRobot 必须安装在当前 Python 环境中。
+需要 Linux、NVIDIA GPU、Python 3.10+ 和 CUDA。LeRobot 必须安装在当前 Python 环境中；本机源码可直接安装：
 
 ```bash
 conda create -n vrae python=3.10 -y
@@ -12,6 +12,7 @@ conda activate vrae
 conda install -c conda-forge ffmpeg -y
 pip install uv
 uv pip install -e .
+uv pip install -e /zsh/code/lerobot-main
 ```
 
 下载官方 V-JEPA 2.1 ViT-L/16 checkpoint：
@@ -24,41 +25,31 @@ curl -fL https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt \
 
 重建 loss 使用 VGG/LPIPS 权重，下载方式见 [third_party/README.md](third_party/README.md)。
 
-## 路径配置
+## 数据与类别
 
-复制 `configs/paths.example.yaml` 为 `configs/paths.local.yaml`，填写 LeRobot 数据根目录和仓库根目录：
-
-```yaml
-project_root: /path/to/V-RAE
-datasets:
-  lerobot: /path/to/lerobot/data
-third_party:
-  vjepa2_1: /path/to/V-RAE/third_party/vjepa2
-```
-
-LeRobot 的 `repo_id`、camera key、clip 长度和训练超参数统一在 `configs/training/vjepa2_1_lerobot.yaml` 中修改。默认单视角；如果使用多个同步相机，配置 `model.multiview` 和 `data.camera_keys` 即可。
-
-## 训练
-
-唯一训练模板：
+共享数据配置为 `configs/data/libero.yaml`，默认读取：
 
 ```text
-configs/training/vjepa2_1_lerobot.yaml
+/zsh/cache/data/Lerobot/libero
 ```
 
-单机八卡：
+40 个类别按 metadata 中的 `task_index` 显式映射：
+
+- `0..9`：`libero_10`
+- `10..19`：`libero_goal`
+- `20..29`：`libero_object`
+- `30..39`：`libero_spatial`
+
+数据集启动时会验证 40 个真实 task 是否被覆盖且没有重复。每个样本的 label 是对应 `suite/task` 的连续 class ID。
+
+## Stage 1：LIBERO 重建训练
+
+配置：`configs/training/vjepa2_1_lerobot.yaml`。V-JEPA 2.1 始终冻结，只训练 temporal pool 和 V-RAE decoder。
+
+单机八卡启动：
 
 ```bash
 scripts/train/vjepa2_1.sh 1 8 0
-```
-
-多机运行时，在所有节点设置相同的 `MASTER_ADDR`/`MASTER_PORT`，并传入不同的 node rank：
-
-```bash
-MASTER_ADDR=10.0.0.8 MASTER_PORT=29500 \
-  scripts/train/vjepa2_1.sh 2 8 0
-MASTER_ADDR=10.0.0.8 MASTER_PORT=29500 \
-  scripts/train/vjepa2_1.sh 2 8 1
 ```
 
 仅检查配置和启动命令：
@@ -67,27 +58,44 @@ MASTER_ADDR=10.0.0.8 MASTER_PORT=29500 \
 VJEPA_DRY_RUN=1 scripts/train/vjepa2_1.sh 1 1 0
 ```
 
-直接使用 Python 入口：
+默认 Stage 1 checkpoint 最终位于：
 
-```bash
-python -m vrae.training.recon_training.train \
-  --config configs/training/vjepa2_1_lerobot.yaml \
-  --paths configs/paths.local.yaml
+```text
+ckpts/recon_training/vjepa2_1_libero_reconstruction/checkpoints/latest.pt
 ```
 
-## 数据契约
+## Stage 2：LIBERO VideoDiT 生成训练
 
-`LeRobotVideoDataset` 从每个 episode 采样同步 clip，输出单视角 `[T,3,H,W]` 或多视角 `[T,V,3,H,W]` 的 float32 `[0,1]` 视频。`num_frames` 必须是 4 的倍数；V-JEPA tubelet=2 与 temporal pool group=2 共同产生 4 倍时间压缩，decoder tubelet 固定为 4。
+配置：`configs/training/libero_videodit.yaml`。它会读取 Stage 1 的 EMA 权重；latent mean/std 不存在时，会先从每个 episode 采样一个 clip，分布式计算通道统计量，然后开始 VideoDiT 训练。
 
-camera key 必须存在于 LeRobot metadata、为 RGB image feature，且所有 view 的分辨率一致。重建训练不依赖 UCF101/Kinetics/Cityscapes/CoVLA manifest。
+单机八卡启动：
+
+```bash
+scripts/train/libero_videodit.sh 1 8 0
+```
+
+只验证构建配置：
+
+```bash
+scripts/train/libero_videodit.sh 1 1 0 --build-only
+```
+
+多机时，在所有节点使用相同的 `MASTER_ADDR`/`MASTER_PORT`，并分别传入 node rank。
+
+## Tensor 契约
+
+`LeRobotVideoDataset` 从每个 episode 采样同步 clip，默认输出 `[T,2,3,256,256]` 的 float32 `[0,1]` 视频。16 帧经过 V-JEPA tubelet=2 和 temporal pool group=2 后得到 `[4,2,1024,16,16]` latent grid，VideoDiT 使用 `[B,4,2,256,1024]` token。
+
+VideoDiT 只更新自身参数；V-JEPA、temporal pool 和 V-RAE decoder 全部冻结。定期采样会从噪声生成双视角 latent，再经冻结的 V-RAE decoder 还原视频。
 
 ## 目录
 
 ```text
-src/vrae/models/                    V-JEPA adapter、V-RAE、pool、decoder
-src/vrae/data/                      LeRobot 数据集、采样和视频读取
-src/vrae/training/recon_training/   Stage 1 重建训练与 loss
-src/vrae/training/common/           DDP、EMA、checkpoint、optimizer 等通用组件
-configs/training/vjepa2_1_lerobot.yaml 唯一训练配置
-third_party/vjepa2/                 官方 V-JEPA 2.1 最小运行时源码
+src/vrae/models/dit/                    class-conditional VideoDiT 与 flow transport
+src/vrae/data/                          LeRobot episode/clip 数据集
+src/vrae/training/recon_training/       Stage 1 重建训练
+src/vrae/training/libero_videogen/      Stage 2 LIBERO 生成入口
+configs/data/libero.yaml                数据、相机和 40 类映射
+configs/training/vjepa2_1_lerobot.yaml  重建配置
+configs/training/libero_videodit.yaml   生成配置
 ```

@@ -124,10 +124,18 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if isinstance(data, Mapping):
         if str(data.get("dataset", "")) == "lerobot":
             cameras = data.get("camera_keys")
-            if not isinstance(cameras, Sequence) or isinstance(cameras, (str, bytes)) or not cameras:
+            if (
+                not isinstance(cameras, Sequence)
+                or isinstance(cameras, (str, bytes))
+                or not cameras
+            ):
                 raise ConfigError("data.camera_keys must be a non-empty list for LeRobot")
             multiview = model.get("multiview", {}) if isinstance(model, Mapping) else {}
-            enabled = bool(multiview.get("enabled", len(cameras) > 1)) if isinstance(multiview, Mapping) else len(cameras) > 1
+            enabled = (
+                bool(multiview.get("enabled", len(cameras) > 1))
+                if isinstance(multiview, Mapping)
+                else len(cameras) > 1
+            )
             if enabled and int(multiview.get("num_views", len(cameras))) != len(cameras):
                 raise ConfigError("model.multiview.num_views must equal len(data.camera_keys)")
             keys: set[str] = set()
@@ -143,16 +151,39 @@ def validate_config(config: Mapping[str, Any]) -> None:
                     raise ConfigError("data.camera_keys keys and stream_id values must be unique")
                 keys.add(key)
                 ids.add(stream_id)
-        video_backend = str(data.get("video_backend", "auto"))
-        if video_backend not in {"auto", "torchcodec"}:
-            raise ConfigError("data.video_backend must be auto or torchcodec")
-        if int(data.get("max_decode_attempts", 128)) <= 0:
-            raise ConfigError("data.max_decode_attempts must be positive")
-        seek_mode = data.get("torchcodec_seek_mode", "approximate")
-        if seek_mode not in {"exact", "approximate"}:
-            raise ConfigError("data.torchcodec_seek_mode must be exact or approximate")
-        if int(data.get("decode_threads", 1)) <= 0:
-            raise ConfigError("data.decode_threads must be positive")
+            class_suites = data.get("class_suites")
+            if class_suites is not None:
+                if (
+                    not isinstance(class_suites, Sequence)
+                    or isinstance(class_suites, (str, bytes))
+                    or not class_suites
+                ):
+                    raise ConfigError("data.class_suites must be a non-empty list")
+                suite_names: set[str] = set()
+                task_indices: set[int] = set()
+                for suite in class_suites:
+                    if not isinstance(suite, Mapping):
+                        raise ConfigError("each data.class_suites entry must be a mapping")
+                    suite_name = str(suite.get("name", "")).strip()
+                    indices = suite.get("task_indices")
+                    if not suite_name or suite_name in suite_names:
+                        raise ConfigError("data.class_suites names must be non-empty and unique")
+                    if (
+                        not isinstance(indices, Sequence)
+                        or isinstance(indices, (str, bytes))
+                        or not indices
+                    ):
+                        raise ConfigError(
+                            f"data.class_suites[{suite_name!r}].task_indices must be non-empty"
+                        )
+                    suite_names.add(suite_name)
+                    for value in indices:
+                        task_index = int(value)
+                        if task_index < 0 or task_index in task_indices:
+                            raise ConfigError(
+                                "data.class_suites task_indices must be unique and non-negative"
+                            )
+                        task_indices.add(task_index)
     training = config.get("training", {})
     if isinstance(training, Mapping) and training.get("resume") and training.get("init_from"):
         raise ConfigError("training.resume and training.init_from are mutually exclusive")
@@ -183,25 +214,19 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if not isinstance(data_pipeline, Mapping):
         raise ConfigError("runtime.data_pipeline must be a mapping")
     if data_pipeline:
-        if data_pipeline.get("kind") != "torchcodec_cpu_bounded":
-            raise ConfigError("runtime.data_pipeline.kind must be torchcodec_cpu_bounded")
+        if data_pipeline.get("kind") != "lerobot_bounded":
+            raise ConfigError("runtime.data_pipeline.kind must be lerobot_bounded")
         for key in (
-            "torchcodec_num_ffmpeg_threads",
-            "torchcodec_cpu_decode_threads",
-            "torchcodec_cpu_max_inflight",
-            "torchcodec_cpu_max_buffered_batches",
-            "torchcodec_cpu_async_prefetch_batches",
-            "torchcodec_cpu_max_decode_attempts_per_batch",
-            "torchcodec_cpu_glibc_arena_max",
-            "torchcodec_cpu_glibc_trim_threshold_bytes",
+            "worker_threads",
+            "max_inflight",
+            "max_buffered_batches",
+            "async_prefetch_batches",
+            "max_decode_attempts_per_batch",
+            "glibc_arena_max",
+            "glibc_trim_threshold_bytes",
         ):
             if int(data_pipeline.get(key, 1)) <= 0:
                 raise ConfigError(f"runtime.data_pipeline.{key} must be positive")
-        seek_mode = data_pipeline.get("torchcodec_seek_mode", "approximate")
-        if seek_mode not in {"exact", "approximate"}:
-            raise ConfigError(
-                "runtime.data_pipeline.torchcodec_seek_mode must be exact or approximate"
-            )
     host_memory = runtime.get("host_memory", {})
     if not isinstance(host_memory, Mapping):
         raise ConfigError("runtime.host_memory must be a mapping")
@@ -210,6 +235,12 @@ def validate_config(config: Mapping[str, Any]) -> None:
     stage1 = config.get("stage1", {})
     if isinstance(stage1, Mapping):
         _checkpoint_relative_to_project(stage1.get("checkpoint"), "stage1.checkpoint")
+    latent_normalizer = config.get("latent_normalizer", {})
+    if isinstance(latent_normalizer, Mapping):
+        _checkpoint_relative_to_project(
+            latent_normalizer.get("path"),
+            "latent_normalizer.path",
+        )
     loss = config.get("loss", {})
     if isinstance(loss, Mapping):
         if "perceptual_frames" in loss and int(loss["perceptual_frames"]) <= 0:

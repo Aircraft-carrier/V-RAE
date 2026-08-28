@@ -59,7 +59,7 @@ def build_reconstruction_dataset(config: Mapping[str, Any], paths: ProjectPaths)
     multiview = config.get("model", {}).get("multiview", {})
     return LeRobotVideoDataset(
         root,
-        repo_id=str(data.get("repo_id", "your-org/your-lerobot-dataset")),
+        repo_id=str(data.get("repo_id", "libero")),
         clip_length=int(data.get("num_frames", 16)),
         frame_interval=int(data.get("frame_interval", 1)),
         sampling=str(data.get("sampling", "random")),
@@ -68,6 +68,7 @@ def build_reconstruction_dataset(config: Mapping[str, Any], paths: ProjectPaths)
         image_size=int(data.get("image_size", 256)),
         random_flip=bool(data.get("random_flip", False)),
         multiview_enabled=bool(multiview.get("enabled", False)),
+        class_suites=data.get("class_suites"),
     )
 
 

@@ -9,6 +9,7 @@ from typing import Any
 from vrae.config import ConfigError
 
 TRAINING_TASKS = {
+    "libero_videogen",
     "recon_training",
 }
 

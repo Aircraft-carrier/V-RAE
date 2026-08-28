@@ -47,6 +47,7 @@ def register_builtin_models() -> None:
         "vrae.models.autoencoder",
         "vrae.models.decoder",
         "vrae.models.pooling",
+        "vrae.models.dit.video_dit",
         "vrae.models.encoders.vjepa2_1",
     )
     for module in modules:

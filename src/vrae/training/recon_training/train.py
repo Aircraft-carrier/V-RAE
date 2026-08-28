@@ -95,7 +95,7 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         "encoder": config["model"]["encoder"]["name"],
         "pool_group": config["model"]["pooling"]["group_size"],
         "attention_mode": config["model"]["decoder"]["attention_mode"],
-        "video_backend": config["data"].get("video_backend", "auto"),
+        "dataset": "lerobot",
         "ddp_gradient_compression": gradient_compression,
     }
 

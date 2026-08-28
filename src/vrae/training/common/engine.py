@@ -1,18 +1,28 @@
-"""Small shared runtime helpers for V-JEPA 2.1 reconstruction training."""
-
 from __future__ import annotations
 
 import argparse
 import os
 import random
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 from vrae.config import load_config, save_resolved_config
 from vrae.paths import ProjectPaths, find_project_root, load_project_paths
+
+
+@dataclass
+class TrainingState:
+    epoch: int = 0
+    step: int = 0
+    gradient_accumulation_microstep: int = 0
 
 
 def seed_everything(seed: int, *, rank: int = 0) -> None:
@@ -22,6 +32,109 @@ def seed_everything(seed: int, *, rank: int = 0) -> None:
     torch.manual_seed(actual)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(actual)
+
+
+def distributed_host_memory_metrics(device: torch.device) -> dict[str, float]:
+    """Collect one host-memory snapshot from every training rank."""
+
+    from vrae.training.common.memory import host_memory_metrics
+
+    local_metrics = host_memory_metrics()
+    local_rss = float(local_metrics.get("memory/host_process_rss_gb", -1.0))
+    local_available = float(local_metrics.get("memory/host_available_gb", -1.0))
+    values = [(local_rss, local_available)]
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        payload = torch.tensor(
+            [local_rss, local_available],
+            dtype=torch.float64,
+            device=device,
+        )
+        gathered = [torch.empty_like(payload) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(gathered, payload)
+        values = [(float(item[0].item()), float(item[1].item())) for item in gathered]
+
+    rss_values = [rss for rss, _ in values if rss >= 0.0]
+    available_values = [available for _, available in values if available >= 0.0]
+    metrics = dict(local_metrics)
+    if rss_values:
+        metrics["memory/host_process_rss_world_sum_gb"] = sum(rss_values)
+        metrics["memory/host_process_rss_rank_max_gb"] = max(rss_values)
+    if available_values:
+        metrics["memory/host_available_min_gb"] = min(available_values)
+    return metrics
+
+
+def resolve_runtime_gradient_checkpointing(configured: bool) -> bool:
+    value = os.environ.get("VRAE_GRADIENT_CHECKPOINTING")
+    if value is None:
+        return bool(configured)
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "VRAE_GRADIENT_CHECKPOINTING must be one of 1/0, true/false, yes/no, or on/off"
+    )
+
+
+def build_flow_transport(config: Mapping[str, Any]):
+    from vrae.models.dit.transport import FlowMatchingTransport
+
+    value = config.get("transport", {})
+    if not isinstance(value, Mapping):
+        raise TypeError("transport configuration must be a mapping")
+    return FlowMatchingTransport(**dict(value))
+
+
+def flow_transport_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
+    transport = build_flow_transport(config)
+    return {
+        "prediction": transport.prediction,
+        "time_dist_type": transport.time_dist_type,
+        "time_dist_shift": transport.time_dist_shift,
+        "t_eps": transport.t_eps,
+        "base_model_coeff": transport.base_model_coeff,
+    }
+
+
+def _training_progress_line(
+    *,
+    task: str,
+    epoch: int,
+    step: int,
+    loss: float,
+    loss_full: float,
+    loss_base: float,
+    ms_per_step: float,
+) -> str:
+    return (
+        f"task={task} epoch={epoch} step={step} "
+        f"loss={loss:.6f} loss_full={loss_full:.6f} loss_base={loss_base:.6f} "
+        f"ms_per_step={ms_per_step:.2f}"
+    )
+
+
+def dit_architecture_metadata(dit: nn.Module) -> dict[str, Any]:
+    encoder_attention = dit.encoder_blocks[0].attn
+    decoder_attention = dit.decoder_blocks[0].attn
+    return {
+        "dit_hidden_size": [int(dit.enc_hidden_size), int(dit.dec_hidden_size)],
+        "dit_depth": [int(dit.num_enc_blocks), int(dit.num_dec_blocks)],
+        "dit_num_heads": [
+            int(encoder_attention.num_heads),
+            int(decoder_attention.num_heads),
+        ],
+        "dit_patch_size": list(dit.patch_size),
+        "dit_base_model_depth": int(dit.base_model_depth),
+        "dit_rope_theta": [
+            float(encoder_attention.rope_theta),
+            float(decoder_attention.rope_theta),
+        ],
+        "dit_time_embedding_size": int(dit.time_embedder.frequencies.numel()),
+        "dit_fourier_frequency_kind": "parameter",
+        "dit_fourier_frequency_trainable_during_training": True,
+    }
 
 
 def parse_config_argument(description: str) -> argparse.Namespace:
@@ -36,13 +149,12 @@ def parse_config_argument(description: str) -> argparse.Namespace:
 def prepare_run(
     config_path: str | Path, paths_path: str | Path | None = None
 ) -> tuple[dict[str, Any], ProjectPaths, Path]:
-    """Resolve paths and create an immutable run directory on rank zero."""
-
     from vrae.training.common.distributed import broadcast_object, initialize_distributed
-    from vrae.training.common.wandb import bind_wandb_run_name, validate_wandb_config
 
     distributed = initialize_distributed()
     config = load_config(config_path)
+    from vrae.training.common.wandb import bind_wandb_run_name, validate_wandb_config
+
     config["wandb"] = bind_wandb_run_name(config.get("wandb", {}), str(config["run_name"]))
     validate_wandb_config(config.get("wandb", {}))
     paths = load_project_paths(
@@ -55,7 +167,6 @@ def prepare_run(
     failure: dict[str, str] | None = None
     if distributed.is_main:
         try:
-            from vrae.checkpoint import CheckpointError, load_checkpoint
             from vrae.training.common.contracts import (
                 compare_resolved_configs,
                 create_run_metadata,
@@ -64,6 +175,7 @@ def prepare_run(
                 update_run_metadata,
                 validate_checkpoint_identity,
             )
+            from vrae.checkpoint import CheckpointError, load_checkpoint
 
             resume_value = config.get("training", {}).get("resume")
             if resume_value:
@@ -106,7 +218,7 @@ def prepare_run(
                 save_resolved_config(metadata, run / "run_metadata.yaml")
             for directory in ("checkpoints", "samples", "wandb"):
                 (run / directory).mkdir(exist_ok=True)
-        except Exception as error:
+        except Exception as error:  # synchronize rank-zero startup failures
             root_error = error
             failure = {"type": type(error).__name__, "message": str(error)}
     failure = broadcast_object(failure)
@@ -117,3 +229,1044 @@ def prepare_run(
             f"Rank 0 failed while preparing the run: {failure['type']}: {failure['message']}"
         )
     return config, paths, run
+
+
+class ClassConditionalVideoDataset:
+    """Build the LeRobot dataset used by class-conditional LIBERO training."""
+
+    @staticmethod
+    def build(config: Mapping[str, Any], paths: ProjectPaths, dataset_name: str):
+        if dataset_name != "lerobot":
+            raise ValueError("class-conditional training only supports dataset_name='lerobot'")
+
+        from vrae.data.lerobot import LeRobotVideoDataset
+
+        data = config["data"]
+        multiview = config.get("model", {}).get("multiview", {})
+        root_value = data.get("root")
+        root = Path(str(root_value)).expanduser() if root_value else paths.dataset("lerobot")
+        return LeRobotVideoDataset(
+            root,
+            repo_id=str(data.get("repo_id", "libero")),
+            clip_length=int(data["num_frames"]),
+            frame_interval=int(data.get("frame_interval", 1)),
+            sampling=str(data.get("sampling", "random")),
+            base_seed=int(data.get("seed", 3407)),
+            camera_keys=data.get("camera_keys"),
+            image_size=(
+                int(data["image_size"])
+                if data.get("image_size") is not None
+                else None
+            ),
+            random_flip=bool(data.get("random_flip", False)),
+            multiview_enabled=bool(multiview.get("enabled", True)),
+            class_suites=data.get("class_suites"),
+        )
+
+
+def _build_bounded_thread_loader(
+    config: Mapping[str, Any],
+    *,
+    dataset: Any,
+    batch_sampler: Any,
+    rank: int,
+):
+    from vrae.training.common.bounded_loader import (
+        AsyncPrefetchLoader,
+        BoundedThreadBatchLoader,
+    )
+
+    runtime = config.get("runtime", {})
+    if not isinstance(runtime, Mapping):
+        raise TypeError("runtime configuration must be a mapping")
+    pipeline = runtime.get("data_pipeline", {})
+    if not isinstance(pipeline, Mapping):
+        raise TypeError("runtime.data_pipeline configuration must be a mapping")
+    core = BoundedThreadBatchLoader(
+        dataset=dataset,
+        batch_sampler=batch_sampler,
+        rank=rank,
+        decode_threads=int(pipeline.get("worker_threads", 8)),
+        max_inflight=int(pipeline.get("max_inflight", 32)),
+        max_buffered_batches=int(pipeline.get("max_buffered_batches", 4)),
+        max_decode_attempts_per_batch=int(
+            pipeline.get("max_decode_attempts_per_batch", 2048)
+        ),
+        pin_memory=bool(pipeline.get("pin_memory", True)),
+        glibc_arena_max=int(pipeline.get("glibc_arena_max", 2)),
+        glibc_trim_threshold_bytes=int(
+            pipeline.get("glibc_trim_threshold_bytes", 128 * 1024**2)
+        ),
+        trim_heap_each_epoch=bool(pipeline.get("trim_heap_each_epoch", True)),
+        collect_python_each_epoch=bool(
+            pipeline.get("collect_python_each_epoch", False)
+        ),
+    )
+    return AsyncPrefetchLoader(
+        core,
+        prefetch_batches=int(pipeline.get("async_prefetch_batches", 2)),
+    )
+
+
+def build_class_conditional_loader(
+    config: Mapping[str, Any],
+    paths: ProjectPaths,
+    *,
+    dataset_name: str,
+    rank: int,
+    world_size: int,
+) -> tuple[Any, Any]:
+    from vrae.training.common.contracts import resolve_batch_contract
+    from vrae.training.common.sampler import StatefulDistributedBatchSampler
+
+    dataset = ClassConditionalVideoDataset.build(config, paths, dataset_name)
+    batch = resolve_batch_contract(config["training"], world_size=world_size)
+    sampler = StatefulDistributedBatchSampler(
+        len(dataset),
+        batch.local_micro_batch_size,
+        rank=rank,
+        world_size=world_size,
+        seed=int(config["data"].get("seed", 3407)),
+        shuffle=True,
+        drop_last=True,
+        gradient_accumulation_steps=batch.gradient_accumulation_steps,
+    )
+
+    loader = _build_bounded_thread_loader(
+        config,
+        dataset=dataset,
+        batch_sampler=sampler,
+        rank=rank,
+    )
+    return loader, sampler
+
+
+def load_frozen_stage1(config: Mapping[str, Any], paths: ProjectPaths, device: torch.device):
+    from vrae.training.common.contracts import STAGE1_WEIGHT_COMPATIBILITY_FIELDS
+    from vrae.training.common.ema import ExponentialMovingAverage
+    from vrae.checkpoint import compare_metadata, load_checkpoint
+    from vrae.models.adapter import VRAELatentAdapter
+    from vrae.models.autoencoder import VRAE
+
+    stage1 = VRAE.from_config(config, project_paths=paths).to(device)
+    payload = load_checkpoint(paths.checkpoint(config["stage1"]["checkpoint"]))
+    expected = stage1.metadata()
+    fields = tuple(field for field in STAGE1_WEIGHT_COMPATIBILITY_FIELDS if field in expected)
+    compare_metadata(expected, payload["model_metadata"], fields)
+    stage1.load_state_dict(payload["model"], strict=True)
+    weight_source = str(config["stage1"].get("weights", "ema"))
+    if weight_source not in {"model", "ema"}:
+        raise ValueError("stage1.weights must be model or ema")
+    if weight_source == "ema":
+        trainable = nn.ModuleDict(stage1.trainable_groups())
+        average = ExponentialMovingAverage(trainable, decay=float(payload["ema"]["decay"]))
+        average.load_state_dict(payload["ema"])
+        average.copy_to(trainable)
+    stage1.requires_grad_(False).eval()
+    adapter_metadata = stage1.metadata()
+    adapter_metadata["checkpoint_weight_source"] = weight_source
+    stage1_precision = str(config["stage1"].get("precision", "fp32"))
+    return VRAELatentAdapter(
+        stage1,
+        adapter_metadata,
+        precision=stage1_precision,
+    ), payload
+
+
+def compute_class_conditional_latent_stats(
+    config: Mapping[str, Any],
+    paths: ProjectPaths,
+    *,
+    dataset_name: str,
+) -> None:
+    from tqdm.auto import tqdm
+
+    from vrae.training.common.distributed import barrier, initialize_distributed
+    from vrae.training.common.latent_norm import DistributedLatentStats
+
+    context = initialize_distributed()
+    stage1, stage1_checkpoint_payload = load_frozen_stage1(config, paths, context.device)
+    # The model has copied all required weights. Do not retain a second full
+    # checkpoint state for the lifetime of the training process.
+    del stage1_checkpoint_payload
+    dataset = ClassConditionalVideoDataset.build(config, paths, dataset_name)
+    local_indices = list(range(context.rank, len(dataset), context.world_size))
+    global_batch = int(config["training"]["global_batch_size"])
+    if global_batch <= 0:
+        raise ValueError("training.global_batch_size must be positive")
+    if global_batch % context.world_size != 0:
+        raise ValueError(
+            "Latent-statistics global batch must be divisible by the distributed world size: "
+            f"global_batch_size={global_batch}, world_size={context.world_size}"
+        )
+    local_batch = global_batch // context.world_size
+
+    class SequentialBatchSampler:
+        def __len__(self) -> int:
+            return (len(local_indices) + local_batch - 1) // local_batch
+
+        def __iter__(self):
+            for start in range(0, len(local_indices), local_batch):
+                yield local_indices[start : start + local_batch]
+
+    loader = _build_bounded_thread_loader(
+        config,
+        dataset=dataset,
+        batch_sampler=SequentialBatchSampler(),
+        rank=context.rank,
+    )
+    stats = DistributedLatentStats(int(stage1.metadata()["hidden_size"]), device=context.device)
+    progress = tqdm(
+        total=len(loader),
+        desc=f"latent stats: {dataset_name} (global_batch={global_batch})",
+        unit="batch",
+        dynamic_ncols=True,
+        disable=not context.is_main,
+    )
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                video = batch["video"].to(context.device, non_blocking=True)
+                if video.dtype == torch.uint8:
+                    video = video.float().div_(255.0)
+                stream_ids = batch.get("stream_ids")
+                if stream_ids is not None:
+                    stream_ids = stream_ids.to(context.device, non_blocking=True)
+                stats.update(stage1.encode_grid(video, stream_ids=stream_ids))
+                progress.update(1)
+    finally:
+        progress.close()
+        loader.close()
+    from vrae.training.common.contracts import structural_stage1_metadata
+
+    metadata = {
+        "stage1": structural_stage1_metadata(stage1.metadata()),
+        "stage1_checkpoint": str(config["stage1"]["checkpoint"]),
+        "dataset": dataset_name,
+        "split": str(config["data"].get("split", "train")),
+        "scope": "one_clip_per_episode",
+        "clean_latent": True,
+        "normalized": False,
+        "clean_latents": True,
+    }
+    normalizer = stats.finalize(metadata=metadata)
+    if context.is_main:
+        output = paths.checkpoint(config["latent_normalizer"]["path"], require_exists=False)
+        normalizer.save(output)
+    barrier()
+
+
+def load_class_conditional_sampling_stack(
+    config: Mapping[str, Any],
+    paths: ProjectPaths,
+    checkpoint: str | Path,
+    device: torch.device,
+    *,
+    stage1_checkpoint_override: str | Path | None = None,
+    latent_normalizer_override: str | Path | None = None,
+):
+    from vrae.training.common.ema import ExponentialMovingAverage
+    from vrae.training.common.latent_norm import (
+        LatentNormalizer,
+        validate_normalizer_compatibility,
+    )
+    from vrae.checkpoint import compare_metadata, load_checkpoint
+
+    stage1_config = dict(config)
+    stage1_config["stage1"] = dict(config["stage1"])
+    if stage1_checkpoint_override is not None:
+        stage1_config["stage1"]["checkpoint"] = str(stage1_checkpoint_override)
+    stage1, _ = load_frozen_stage1(stage1_config, paths, device)
+    chunks = int(config["data"]["num_frames"]) // 4
+    dit = build_class_conditional_dit(config, stage1.metadata(), num_chunks=chunks).to(device)
+    normalizer_path = paths.checkpoint(
+        latent_normalizer_override
+        if latent_normalizer_override is not None
+        else config["latent_normalizer"]["path"]
+    )
+    normalizer = LatentNormalizer.load(normalizer_path).to(device)
+    validate_normalizer_compatibility(
+        normalizer,
+        stage1_metadata=stage1.metadata(),
+        stage1_checkpoint=str(config["stage1"]["checkpoint"]),
+        dataset=str(config["data"]["dataset"]),
+        split=str(config["data"].get("split", "train")),
+        scope="one_clip_per_episode",
+    )
+    payload = load_checkpoint(paths.checkpoint(checkpoint))
+    expected_metadata = class_conditional_metadata(config, stage1.metadata(), dit, normalizer)
+    compare_metadata(
+        expected_metadata,
+        payload["model_metadata"],
+        tuple(expected_metadata),
+    )
+    dit.load_state_dict(payload["model"], strict=True)
+    if payload.get("ema") is not None:
+        average = ExponentialMovingAverage(dit, decay=float(payload["ema"]["decay"]))
+        average.load_state_dict(payload["ema"])
+        average.copy_to(dit)
+    return stage1, dit.eval(), normalizer
+
+
+def build_class_conditional_dit(
+    config: Mapping[str, Any], stage1_metadata: Mapping[str, Any], *, num_chunks: int
+) -> nn.Module:
+    from vrae.registry import DIT_MODELS, register_builtin_models
+
+    register_builtin_models()
+    image_size = config["data"].get("image_size", 256)
+    if isinstance(image_size, int):
+        image_size = (image_size, image_size)
+    patch = int(stage1_metadata["patch_size"])
+    grid = (int(image_size[0]) // patch, int(image_size[1]) // patch)
+    dit_config = dict(config["dit"])
+    multiview = config.get("model", {}).get("multiview", {})
+    if isinstance(multiview, Mapping):
+        dit_config.setdefault("multiview_enabled", bool(multiview.get("enabled", False)))
+        for key in ("num_views", "num_streams", "use_view_embedding"):
+            if key in multiview:
+                dit_config.setdefault(key, multiview[key])
+    dit_config.pop("input_dim", None)
+    return DIT_MODELS.build(
+        dit_config,
+        num_chunks=num_chunks,
+        grid_size=grid,
+        in_channels=int(stage1_metadata["hidden_size"]),
+        num_classes=int(config["dit"]["num_classes"]),
+    )
+
+
+def class_conditional_metadata(
+    config: Mapping[str, Any],
+    stage1_metadata: Mapping[str, Any],
+    dit: nn.Module,
+    normalizer: Any | None = None,
+) -> dict[str, Any]:
+    from vrae.training.common.contracts import structural_stage1_metadata
+    from vrae.training.common.latent_norm import normalizer_identity
+
+    return {
+        "stage1": structural_stage1_metadata(stage1_metadata),
+        "stage1_checkpoint": str(config["stage1"]["checkpoint"]),
+        "latent_normalizer_source": str(config["latent_normalizer"]["path"]),
+        "dit_name": "vrae_video_dit",
+        "dit_input_dim": int(dit.in_channels),
+        "dit_num_chunks": int(dit.num_chunks),
+        "dit_grid_size": list(dit.grid_size),
+        "dit_num_classes": int(dit.num_classes),
+        "dit_multiview_enabled": bool(getattr(dit, "multiview_enabled", False)),
+        "dit_num_views": int(getattr(dit, "num_views", 1)),
+        "dit_num_streams": int(getattr(dit, "num_streams", 1)),
+        "dit_class_suites": [dict(item) for item in config["data"]["class_suites"]],
+        **dit_architecture_metadata(dit),
+        "transport": flow_transport_metadata(config),
+        "latent_normalizer_identity": (
+            normalizer_identity(normalizer) if normalizer is not None else None
+        ),
+    }
+
+
+def train_class_conditional(
+    config: dict[str, Any],
+    paths: ProjectPaths,
+    run: Path,
+    *,
+    dataset_name: str,
+    max_steps: int | None = None,
+) -> None:
+    from vrae.training.common.accumulation import GradientAccumulator, optimizer_step
+    from vrae.training.common.checkpoint import (
+        build_training_checkpoint,
+        load_model_init,
+        resume_training,
+        save_training_checkpoint,
+    )
+    from vrae.training.common.contracts import (
+        load_run_metadata,
+        resolve_batch_contract,
+        resolve_checkpoint_interval_steps,
+        update_decoder_execution_metadata,
+        update_run_metadata,
+    )
+    from vrae.training.common.distributed import (
+        barrier,
+        gather_rng_states,
+        initialize_distributed,
+        reduce_mean,
+    )
+    from vrae.training.common.ema import ExponentialMovingAverage
+    from vrae.training.common.latent_norm import (
+        LatentNormalizer,
+        validate_normalizer_compatibility,
+    )
+    from vrae.training.common.optim import build_optimizer, build_scheduler
+    from vrae.training.common.precision import PrecisionPolicy
+    from vrae.training.common.visualization import save_sample_tensors, video_to_uint8
+    from vrae.training.common.wandb import WandbLogger
+
+    context = initialize_distributed()
+    seed_everything(int(config["data"].get("seed", 3407)), rank=context.rank)
+    stage1, stage1_checkpoint_payload = load_frozen_stage1(config, paths, context.device)
+    del stage1_checkpoint_payload
+    num_chunks = int(config["data"]["num_frames"]) // 4
+    dit = build_class_conditional_dit(config, stage1.metadata(), num_chunks=num_chunks).to(
+        context.device
+    )
+    for embedder in (dit.encoder_embed, dit.decoder_embed):
+        embedder.proj.to(memory_format=torch.channels_last)
+    gradient_checkpointing_configured = bool(dit.gradient_checkpointing)
+    gradient_checkpointing_resolved = resolve_runtime_gradient_checkpointing(
+        gradient_checkpointing_configured
+    )
+    dit.set_gradient_checkpointing(gradient_checkpointing_resolved)
+    dit.requires_grad_(True)
+    model: nn.Module = dit
+    if context.world_size > 1:
+        model = DistributedDataParallel(
+            dit,
+            device_ids=[context.local_rank] if context.device.type == "cuda" else None,
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+            static_graph=True,
+        )
+    normalizer = LatentNormalizer.load(paths.checkpoint(config["latent_normalizer"]["path"])).to(
+        context.device
+    )
+    validate_normalizer_compatibility(
+        normalizer,
+        stage1_metadata=stage1.metadata(),
+        stage1_checkpoint=str(config["stage1"]["checkpoint"]),
+        dataset=dataset_name,
+        split=str(config["data"].get("split", "train")),
+        scope="one_clip_per_episode",
+    )
+    metadata = class_conditional_metadata(config, stage1.metadata(), dit, normalizer)
+    optimizer = build_optimizer(dit.parameters(), config["training"]["optimizer"])
+    ema = ExponentialMovingAverage(dit, decay=float(config["training"]["ema"]["decay"]))
+    precision = PrecisionPolicy(
+        str(config["training"].get("precision", "bf16")), context.device.type
+    )
+    scaler = precision.make_scaler()
+    transport = build_flow_transport(config)
+    loader, sampler = build_class_conditional_loader(
+        config,
+        paths,
+        dataset_name=dataset_name,
+        rank=context.rank,
+        world_size=context.world_size,
+    )
+    metadata["dit_class_names"] = list(loader.dataset.class_names)
+    accumulation = GradientAccumulator(
+        int(config["training"].get("gradient_accumulation_steps", 1))
+    )
+    steps_per_epoch = len(loader) // accumulation.steps
+    checkpoint_interval = resolve_checkpoint_interval_steps(
+        config["training"], steps_per_epoch=steps_per_epoch
+    )
+    scheduler = build_scheduler(
+        optimizer,
+        config["training"]["scheduler"],
+        steps_per_epoch=steps_per_epoch,
+    )
+    batch_contract = resolve_batch_contract(config["training"], world_size=context.world_size)
+    if context.is_main:
+        update_run_metadata(
+            run,
+            {
+                "world_size": context.world_size,
+                "local_micro_batch_size": batch_contract.local_micro_batch_size,
+                "global_micro_batch_size": batch_contract.global_micro_batch_size,
+                "steps_per_epoch": steps_per_epoch,
+                "checkpoint_interval_steps": checkpoint_interval,
+                "gradient_checkpointing_configured": gradient_checkpointing_configured,
+                "gradient_checkpointing_resolved": gradient_checkpointing_resolved,
+                "optimizer_fused": bool(optimizer.defaults.get("fused", False)),
+                "ddp_gradient_as_bucket_view": context.world_size > 1,
+                "ddp_static_graph": context.world_size > 1,
+                "distributed_timeout_seconds": context.timeout_seconds,
+                "dataloader_timeout_seconds": float(loader.timeout),
+                "dataloader_prefetch_factor": loader.prefetch_factor,
+                "dataloader_persistent_workers": bool(loader.persistent_workers),
+                "data_pipeline_kind": str(
+                    config.get("runtime", {})
+                    .get("data_pipeline", {})
+                    .get("kind", "lerobot_bounded")
+                ),
+                "data_decode_threads": int(
+                    getattr(getattr(loader, "loader", None), "decode_threads", 0)
+                ),
+                "data_max_inflight": int(
+                    getattr(getattr(loader, "loader", None), "max_inflight", 0)
+                ),
+                "data_max_buffered_batches": int(
+                    getattr(getattr(loader, "loader", None), "max_buffered_batches", 0)
+                ),
+                "data_backend": "lerobot",
+            },
+        )
+        wandb_run_id = str(load_run_metadata(run)["wandb_run_id"])
+    else:
+        wandb_run_id = None
+    start_epoch = 0
+    step = 0
+    init_path = config["training"].get("init_from")
+    resume_path = config["training"].get("resume")
+    metadata_fields = tuple(metadata)
+    if init_path:
+        load_model_init(
+            paths.checkpoint(init_path),
+            dit,
+            expected_metadata=metadata,
+            metadata_fields=metadata_fields,
+        )
+    if resume_path:
+        resume_checkpoint = paths.checkpoint(resume_path)
+        allow_world_size_change = os.environ.get(
+            "VRAE_ALLOW_WORLD_SIZE_CHANGE_ON_RESUME", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        if context.is_main and allow_world_size_change:
+            print(
+                "[resume] allowing an epoch-boundary world-size change; "
+                "rank-local RNG streams will be re-seeded",
+                flush=True,
+            )
+        payload = resume_training(
+            resume_checkpoint,
+            model=dit,
+            ema=ema,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            sampler=sampler,
+            expected_metadata=metadata,
+            metadata_fields=metadata_fields,
+            current_config=config,
+            run_directory=run,
+            allow_world_size_change=allow_world_size_change,
+        )
+        accumulation.load_data_state(payload["data_state"])
+        start_epoch, step = sampler.epoch, int(payload["step"])
+        # Optimizer/model/sampler have copied the resumed state; keeping the
+        # 20+ GiB payload mapped or resident would only consume host memory.
+        del payload
+
+    logger = WandbLogger(
+        config["wandb"],
+        enabled=context.is_main,
+        run_dir=str(run / "wandb"),
+        run_id=wandb_run_id,
+        exact_resume=bool(resume_path),
+        resume_from_step=step if resume_path else None,
+        run_config=config,
+    )
+
+    if max_steps is not None and step >= int(max_steps):
+        close_loader = getattr(loader, "close", None)
+        if callable(close_loader):
+            close_loader()
+        logger.finish()
+        return
+
+    runtime = config.get("runtime", {})
+    checkpoint_runtime = runtime.get("checkpoint", {})
+    host_memory_runtime = runtime.get("host_memory", {})
+    checkpoint_drop_page_cache = bool(checkpoint_runtime.get("drop_page_cache", False))
+    log_host_memory = bool(host_memory_runtime.get("log", False))
+    min_host_available_gb = float(host_memory_runtime.get("min_available_gb", 0.0))
+    if min_host_available_gb < 0.0:
+        raise ValueError("runtime.host_memory.min_available_gb must be non-negative")
+
+    epochs = int(config["training"].get("epochs", 1))
+    last_saved_step = step
+    stop = False
+    memory_guard_message: str | None = None
+    data_wait_seconds = 0.0
+    data_wait_max_seconds = 0.0
+    data_wait_batches = 0
+    throughput_window_started_at = time.perf_counter()
+    throughput_window_updates = 0
+    cuda_batch_events: list[tuple[torch.cuda.Event, ...]] = []
+    cuda_update_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+    for epoch in range(start_epoch, epochs):
+        loader.dataset.set_epoch(epoch)
+        batch_requested_at = time.perf_counter()
+        for batch in loader:
+            batch_received_at = time.perf_counter()
+            data_wait = batch_received_at - batch_requested_at
+            data_wait_seconds += data_wait
+            data_wait_max_seconds = max(data_wait_max_seconds, data_wait)
+            data_wait_batches += 1
+            if accumulation.is_first_microstep:
+                optimizer.zero_grad(set_to_none=True)
+            if context.device.type == "cuda":
+                transfer_started = torch.cuda.Event(enable_timing=True)
+                transfer_finished = torch.cuda.Event(enable_timing=True)
+                stage1_finished = torch.cuda.Event(enable_timing=True)
+                backward_finished = torch.cuda.Event(enable_timing=True)
+                transfer_started.record()
+            video = batch["video"].to(context.device, non_blocking=True)
+            if video.dtype == torch.uint8:
+                video = video.float().div_(255.0)
+            labels = batch["label"].to(context.device, non_blocking=True)
+            stream_ids = batch.get("stream_ids")
+            if stream_ids is not None:
+                stream_ids = stream_ids.to(context.device, non_blocking=True)
+            if context.device.type == "cuda":
+                transfer_finished.record()
+            with torch.no_grad():
+                grid = stage1.encode_grid(video, stream_ids=stream_ids)
+                clean = normalizer.normalize(stage1.grid_to_tokens(grid))
+            if context.device.type == "cuda":
+                stage1_finished.record()
+            with accumulation.sync_context(model):
+                with precision.autocast():
+                    losses = transport.training_losses(
+                        model,
+                        clean,
+                        model_kwargs={
+                            "labels": labels,
+                            **(
+                                {"stream_ids": stream_ids}
+                                if stream_ids is not None
+                                else {}
+                            ),
+                        },
+                    )
+                    loss = losses["loss"]
+                accumulation.backward(loss, scaler)
+            if context.device.type == "cuda":
+                backward_finished.record()
+                cuda_batch_events.append(
+                    (
+                        transfer_started,
+                        transfer_finished,
+                        stage1_finished,
+                        backward_finished,
+                    )
+                )
+            sampler.commit_batch()
+            if not accumulation.advance():
+                batch_requested_at = time.perf_counter()
+                continue
+            if not optimizer_step(
+                optimizer,
+                scaler=scaler,
+                max_grad_norm=config["training"].get("clip_grad"),
+                parameters=dit.parameters(),
+            ):
+                batch_requested_at = time.perf_counter()
+                continue
+            scheduler.step()
+            ema.update(dit)
+            if context.device.type == "cuda":
+                update_finished = torch.cuda.Event(enable_timing=True)
+                update_finished.record()
+                cuda_update_events.append((backward_finished, update_finished))
+            step += 1
+            throughput_window_updates += 1
+            log_interval = int(config["wandb"]["log_interval"])
+            if step % log_interval == 0:
+                if context.device.type == "cuda":
+                    torch.cuda.synchronize(context.device)
+                window_seconds = time.perf_counter() - throughput_window_started_at
+                reduced_losses = reduce_mean(
+                    torch.stack(
+                        (
+                            losses["loss"],
+                            losses["loss_full"],
+                            losses["loss_base"],
+                        )
+                    ).detach()
+                )
+                reduced_loss, reduced_loss_full, reduced_loss_base = reduced_losses.unbind()
+                timing_sum_count = torch.tensor(
+                    [data_wait_seconds, float(data_wait_batches)],
+                    dtype=torch.float64,
+                    device=context.device,
+                )
+                timing_max = torch.tensor(
+                    [data_wait_max_seconds, window_seconds],
+                    dtype=torch.float64,
+                    device=context.device,
+                )
+                if cuda_batch_events:
+                    profile_values = torch.tensor(
+                        [
+                            sum(
+                                start.elapsed_time(copied)
+                                for start, copied, _, _ in cuda_batch_events
+                            ),
+                            sum(
+                                copied.elapsed_time(encoded)
+                                for _, copied, encoded, _ in cuda_batch_events
+                            ),
+                            sum(
+                                encoded.elapsed_time(backward)
+                                for _, _, encoded, backward in cuda_batch_events
+                            ),
+                            sum(start.elapsed_time(end) for start, end in cuda_update_events),
+                            float(len(cuda_batch_events)),
+                            float(len(cuda_update_events)),
+                        ],
+                        dtype=torch.float64,
+                        device=context.device,
+                    )
+                else:
+                    profile_values = torch.zeros(6, dtype=torch.float64, device=context.device)
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(timing_sum_count)
+                    torch.distributed.all_reduce(
+                        timing_max,
+                        op=torch.distributed.ReduceOp.MAX,
+                    )
+                    torch.distributed.all_reduce(profile_values)
+                host_metrics = (
+                    distributed_host_memory_metrics(context.device)
+                    if log_host_memory or min_host_available_gb > 0.0
+                    else {}
+                )
+                mean_data_wait_ms = float(
+                    (timing_sum_count[0] / timing_sum_count[1].clamp_min(1)).item() * 1000
+                )
+                max_data_wait_ms = float(timing_max[0].item() * 1000)
+                updates_per_second = throughput_window_updates / max(
+                    float(timing_max[1].item()), 1e-9
+                )
+                ms_per_step = 1000.0 / updates_per_second
+                samples_per_second = updates_per_second * batch_contract.global_batch_size
+                batch_profile_count = max(float(profile_values[4].item()), 1.0)
+                update_profile_count = max(float(profile_values[5].item()), 1.0)
+                h2d_ms = float(profile_values[0].item() / batch_profile_count)
+                stage1_ms = float(profile_values[1].item() / batch_profile_count)
+                dit_ms = float(profile_values[2].item() / batch_profile_count)
+                update_ms = float(profile_values[3].item() / update_profile_count)
+                min_available_gb = host_metrics.get("memory/host_available_min_gb")
+                memory_guard_triggered = (
+                    min_host_available_gb > 0.0
+                    and min_available_gb is not None
+                    and min_available_gb < min_host_available_gb
+                )
+                data_wait_seconds = 0.0
+                data_wait_max_seconds = 0.0
+                data_wait_batches = 0
+                reset_throughput_window = True
+            else:
+                reduced_loss = None
+                reduced_loss_full = None
+                reduced_loss_base = None
+                mean_data_wait_ms = None
+                max_data_wait_ms = None
+                updates_per_second = None
+                ms_per_step = None
+                samples_per_second = None
+                h2d_ms = None
+                stage1_ms = None
+                dit_ms = None
+                update_ms = None
+                host_metrics = {}
+                min_available_gb = None
+                memory_guard_triggered = False
+                reset_throughput_window = False
+            if context.is_main and reduced_loss is not None:
+                print(
+                    _training_progress_line(
+                        task=str(config["task"]),
+                        epoch=epoch,
+                        step=step,
+                        loss=float(reduced_loss.item()),
+                        loss_full=float(reduced_loss_full.item()),
+                        loss_base=float(reduced_loss_base.item()),
+                        ms_per_step=ms_per_step,
+                    ),
+                    flush=True,
+                )
+                logger.log(
+                    {
+                        "train/loss": float(reduced_loss.item()),
+                        "train/loss_total": float(reduced_loss.item()),
+                        "train/loss_full": float(reduced_loss_full.item()),
+                        "train/loss_base": float(reduced_loss_base.item()),
+                        "train/epoch": epoch,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/learning_rate": optimizer.param_groups[0]["lr"],
+                        "train/step_time_sec": 1.0 / updates_per_second,
+                        "train/steps_per_sec": updates_per_second,
+                        "train/samples_per_sec": samples_per_second,
+                        "train/global_batch_size": batch_contract.global_batch_size,
+                        "train/data_wait_ms_mean": mean_data_wait_ms,
+                        "train/data_wait_ms_max": max_data_wait_ms,
+                        "train/updates_per_second": updates_per_second,
+                        "train/samples_per_second": samples_per_second,
+                        "train/h2d_ms": h2d_ms,
+                        "train/stage1_ms": stage1_ms,
+                        "train/dit_ms": dit_ms,
+                        "train/update_ms": update_ms,
+                        **host_metrics,
+                        **(
+                            {
+                                "memory/allocated_gb": torch.cuda.memory_allocated(context.device)
+                                / (1024**3),
+                                "memory/reserved_gb": torch.cuda.memory_reserved(context.device)
+                                / (1024**3),
+                                "memory/max_allocated_gb": torch.cuda.max_memory_allocated(
+                                    context.device
+                                )
+                                / (1024**3),
+                            }
+                            if context.device.type == "cuda"
+                            else {}
+                        ),
+                    },
+                    step=step,
+                )
+            if memory_guard_triggered:
+                accumulation.require_boundary()
+                rng_state = gather_rng_states()
+                if context.is_main:
+                    memory_guard_message = (
+                        "Host-memory guard stopped training before node exhaustion: "
+                        f"available={float(min_available_gb):.2f} GiB, "
+                        f"required={min_host_available_gb:.2f} GiB"
+                    )
+                    print(f"[memory-guard] {memory_guard_message}", flush=True)
+                    payload = build_training_checkpoint(
+                        task=str(config["task"]),
+                        epoch=sampler.epoch,
+                        step=step,
+                        model=dit,
+                        ema=ema,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        data_state=sampler.state_dict(
+                            gradient_accumulation_microstep=accumulation.microstep
+                        ),
+                        resolved_config=config,
+                        model_metadata=metadata,
+                        rng_state=rng_state,
+                    )
+                    save_training_checkpoint(
+                        payload,
+                        run / "checkpoints",
+                        drop_page_cache=checkpoint_drop_page_cache,
+                    )
+                    del payload
+                barrier()
+                if memory_guard_message is None:
+                    memory_guard_message = (
+                        "Host-memory guard stopped training before node exhaustion"
+                    )
+                last_saved_step = step
+                stop = True
+                break
+            sample_interval = int(config["wandb"]["sample_interval"])
+            if step % sample_interval == 0:
+                if context.is_main:
+                    sample_count = int(config["wandb"].get("sample_count", 4))
+                    sample_ids = [step * sample_count + index for index in range(sample_count)]
+                    configured_class_ids = config["sampling"].get("class_ids")
+                    if configured_class_ids:
+                        class_ids = [int(value) for value in configured_class_ids]
+                        sample_labels = torch.tensor(
+                            [class_ids[index % len(class_ids)] for index in range(sample_count)]
+                        )
+                    else:
+                        sample_labels = torch.arange(sample_count) % int(dit.num_classes)
+                    was_training = dit.training
+                    dit.eval()
+                    with ema.average_parameters(dit), precision.autocast():
+                        sampled_video = generate_class_conditional(
+                            dit,
+                            stage1,
+                            normalizer,
+                            transport=transport,
+                            sample_ids=sample_ids,
+                            labels=sample_labels,
+                            base_seed=int(config["sampling"]["base_seed"]),
+                            num_chunks=dit.num_chunks,
+                            grid_size=tuple(dit.grid_size),
+                            channels=dit.in_channels,
+                            steps=int(config["sampling"]["steps"]),
+                            cfg_scale=float(config["sampling"]["cfg_scale"]),
+                            internal_guidance_scale=float(
+                                config["sampling"]["internal_guidance_scale"]
+                            ),
+                            internal_guidance_t_min=float(
+                                config["sampling"].get("internal_guidance_t_min", 0.0)
+                            ),
+                            internal_guidance_t_max=float(
+                                config["sampling"].get("internal_guidance_t_max", 1.0)
+                            ),
+                            device=context.device,
+                        )
+                    dit.train(was_training)
+                    save_sample_tensors(
+                        {"video": sampled_video, "labels": sample_labels},
+                        run / "samples" / f"step-{step:08d}.pt",
+                    )
+                    logger.log_video(
+                        "samples",
+                        video_to_uint8(sampled_video),
+                        step=step,
+                        fps=int(config["data"].get("fps", 8)),
+                        caption=(
+                            f"step={step}, cfg={float(config['sampling']['cfg_scale']):g}, "
+                            f"ig={float(config['sampling']['internal_guidance_scale']):g}, "
+                            f"sampling_steps={int(config['sampling']['steps'])}"
+                        ),
+                    )
+                    update_decoder_execution_metadata(
+                        run,
+                        stage1.decoder_execution_metadata(),
+                        training_dtype=precision.name,
+                    )
+                barrier()
+            if step % checkpoint_interval == 0:
+                rng_state = gather_rng_states()
+                if context.is_main:
+                    payload = build_training_checkpoint(
+                        task=str(config["task"]),
+                        epoch=sampler.epoch,
+                        step=step,
+                        model=dit,
+                        ema=ema,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        data_state=sampler.state_dict(
+                            gradient_accumulation_microstep=accumulation.microstep
+                        ),
+                        resolved_config=config,
+                        model_metadata=metadata,
+                        rng_state=rng_state,
+                    )
+                    save_training_checkpoint(
+                        payload,
+                        run / "checkpoints",
+                        drop_page_cache=checkpoint_drop_page_cache,
+                    )
+                    del payload
+                last_saved_step = step
+            if max_steps is not None and step >= max_steps:
+                stop = True
+                break
+            if reset_throughput_window:
+                throughput_window_started_at = time.perf_counter()
+                throughput_window_updates = 0
+                cuda_batch_events.clear()
+                cuda_update_events.clear()
+            batch_requested_at = time.perf_counter()
+        if stop:
+            break
+        release_epoch_memory = getattr(loader, "release_epoch_memory", None)
+        if callable(release_epoch_memory):
+            release_epoch_memory()
+    if step > 0 and step != last_saved_step:
+        accumulation.require_boundary()
+        rng_state = gather_rng_states()
+        if context.is_main:
+            payload = build_training_checkpoint(
+                task=str(config["task"]),
+                epoch=sampler.epoch,
+                step=step,
+                model=dit,
+                ema=ema,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                data_state=sampler.state_dict(
+                    gradient_accumulation_microstep=accumulation.microstep
+                ),
+                resolved_config=config,
+                model_metadata=metadata,
+                rng_state=rng_state,
+            )
+            save_training_checkpoint(
+                payload,
+                run / "checkpoints",
+                drop_page_cache=checkpoint_drop_page_cache,
+            )
+            del payload
+    close_loader = getattr(loader, "close", None)
+    if callable(close_loader):
+        close_loader()
+    logger.finish()
+    if memory_guard_message is not None:
+        raise RuntimeError(memory_guard_message)
+
+
+@torch.no_grad()
+def generate_class_conditional(
+    dit: nn.Module,
+    stage1,
+    normalizer,
+    *,
+    transport,
+    sample_ids: list[int],
+    labels: torch.Tensor,
+    base_seed: int,
+    num_chunks: int,
+    grid_size: tuple[int, int],
+    channels: int,
+    steps: int,
+    cfg_scale: float,
+    internal_guidance_scale: float,
+    device: torch.device,
+    internal_guidance_t_min: float = 0.0,
+    internal_guidance_t_max: float = 1.0,
+) -> torch.Tensor:
+    def sample_seed(sample_id: int) -> int:
+        value = ((int(base_seed) << 32) ^ int(sample_id)) & 0xFFFFFFFFFFFFFFFF
+        value = (value + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+        return (value ^ (value >> 31)) & 0x7FFFFFFFFFFFFFFF
+
+    samples = []
+    multiview = bool(getattr(dit, "multiview_enabled", False))
+    num_views = int(getattr(dit, "num_views", 1))
+    sample_shape = (
+        (num_chunks, num_views, grid_size[0] * grid_size[1], channels)
+        if multiview
+        else (num_chunks, grid_size[0] * grid_size[1], channels)
+    )
+    for sample_id in sample_ids:
+        generator = torch.Generator(device=device).manual_seed(sample_seed(sample_id))
+        samples.append(
+            torch.randn(
+                sample_shape,
+                generator=generator,
+                device=device,
+            )
+        )
+    noise = torch.stack(samples)
+    labels = labels.to(device)
+    stream_ids = (
+        torch.arange(num_views, device=device).expand(labels.shape[0], num_views)
+        if multiview
+        else None
+    )
+    conditional_mask = torch.zeros(labels.shape[0], dtype=torch.bool, device=device)
+    unconditional_mask = torch.ones_like(conditional_mask)
+    stream_kwargs = {"stream_ids": stream_ids} if stream_ids is not None else {}
+    normalized = transport.euler_sample(
+        dit,
+        noise,
+        model_kwargs={
+            "labels": labels,
+            "condition_drop_mask": conditional_mask,
+            **stream_kwargs,
+        },
+        unconditional_kwargs={
+            "labels": labels,
+            "condition_drop_mask": unconditional_mask,
+            **stream_kwargs,
+        },
+        num_steps=steps,
+        cfg_scale=cfg_scale,
+        ig_scale=internal_guidance_scale,
+        ig_intervals=((internal_guidance_t_min, internal_guidance_t_max),),
+    )
+    clean_tokens = normalizer.denormalize(normalized)
+    clean_grid = stage1.tokens_to_grid(clean_tokens, height=grid_size[0], width=grid_size[1])
+    return stage1.decode_grid(clean_grid, stream_ids=stream_ids)
