@@ -84,7 +84,7 @@ scripts/train/libero_videodit.sh 1 1 0 --build-only
 
 ## Tensor 契约
 
-`LeRobotVideoDataset` 从每个 episode 采样同步 clip，默认输出 `[T,2,3,256,256]` 的 float32 `[0,1]` 视频。16 帧经过 V-JEPA tubelet=2 和 temporal pool group=2 后得到 `[4,2,1024,16,16]` latent grid，VideoDiT 使用 `[B,4,2,256,1024]` token。
+`LeRobotVideoDataset` 从每个 episode 采样同步 clip，默认输出 `[T,2,3,256,256]` 的 float32 `[0,1]` 视频。V-RAE encoder/decoder 保持原始单视角接口；进入 V-RAE 前将 `[B,T,V,C,H,W]` 重排为 `[B*V,T,C,H,W]`。16 帧经过 V-JEPA tubelet=2 和 temporal pool group=2 后，V-RAE 看到 `[B*V,4,1024,16,16]` latent grid；VideoDiT 仍可使用其原有的 `[B,4,2,256,1024]` 多视角 token 和 `stream_ids` 逻辑。
 
 VideoDiT 只更新自身参数；V-JEPA、temporal pool 和 V-RAE decoder 全部冻结。定期采样会从噪声生成双视角 latent，再经冻结的 V-RAE decoder 还原视频。
 

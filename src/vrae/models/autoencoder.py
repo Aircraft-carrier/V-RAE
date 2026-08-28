@@ -57,10 +57,6 @@ class VRAE(nn.Module):
         self.encoder = encoder
         self.temporal_pool = temporal_pool
         self.decoder = decoder
-        self.multiview_enabled = False
-        self.num_views = 1
-        self.num_streams = 1
-        self.multiview_camera_keys: list[dict[str, Any]] = []
         self.encoder.requires_grad_(False)
         self.encoder.eval()
         self.temporal_pool.requires_grad_(True)
@@ -93,7 +89,6 @@ class VRAE(nn.Module):
                 f"Encoder tubelet and pooling group must compress time by 4, got {compression}"
             )
         decoder_value = dict(model_config["decoder"])
-        multiview = model_config.get("multiview", {})
         decoder_value.setdefault("name", "vrae_decoder")
         init_mode = str(decoder_value.pop("init", "scratch"))
         init_checkpoint = decoder_value.pop("checkpoint", None)
@@ -123,12 +118,6 @@ class VRAE(nn.Module):
         elif init_checkpoint is not None:
             raise ValueError("decoder.checkpoint is only valid with decoder.init=raev2_image")
         instance = cls(encoder, pool, decoder)
-        if isinstance(multiview, Mapping):
-            instance.multiview_enabled = bool(multiview.get("enabled", False))
-            instance.num_views = int(multiview.get("num_views", 1))
-            instance.num_streams = int(multiview.get("num_streams", instance.num_views))
-        if isinstance(data_config, Mapping) and isinstance(data_config.get("camera_keys"), list):
-            instance.multiview_camera_keys = [dict(item) if isinstance(item, Mapping) else {"key": str(item)} for item in data_config["camera_keys"]]
         return instance
 
     def train(self, mode: bool = True) -> VRAE:
@@ -141,25 +130,15 @@ class VRAE(nn.Module):
         self._validate_video(video)
         return self.encoder(video)
 
-    def encode(self, video: torch.Tensor, stream_ids: torch.Tensor | None = None) -> torch.Tensor:
-        if self.multiview_enabled:
-            if video.ndim != 6:
-                raise ValueError(f"Expected multiview video [B,T,V,3,H,W], got {tuple(video.shape)}")
-            batch, time, views, channels, height, width = video.shape
-            if channels != 3:
-                raise ValueError("Multiview video must have RGB channels")
-            flat = video.permute(0, 2, 1, 3, 4, 5).reshape(batch * views, time, channels, height, width)
-            latent = self.temporal_pool(self.encode_frames(flat))
-            _, chunks, latent_channels, latent_height, latent_width = latent.shape
-            return latent.reshape(batch, views, chunks, latent_channels, latent_height, latent_width).permute(0, 2, 1, 3, 4, 5).contiguous()
+    def encode(self, video: torch.Tensor) -> torch.Tensor:
         features = self.encode_frames(video)
         return self.temporal_pool(features)
 
-    def decode(self, clean_latents: torch.Tensor, stream_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def decode(self, clean_latents: torch.Tensor) -> torch.Tensor:
         return self.decoder(clean_latents)
 
-    def forward(self, video: torch.Tensor, stream_ids: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
-        clean_latents = self.encode(video, stream_ids=stream_ids)
+    def forward(self, video: torch.Tensor) -> dict[str, torch.Tensor]:
+        clean_latents = self.encode(video)
         return {"recon": self.decode(clean_latents), "latents": clean_latents}
 
     def trainable_groups(self) -> dict[str, nn.Module]:
@@ -191,10 +170,6 @@ class VRAE(nn.Module):
             "decoder_spatial_position_resize": "bicubic",
             "decoder_execution": self.decoder.execution_metadata(),
             "temporal_compression_ratio": self.temporal_compression_ratio,
-            "multiview_enabled": self.multiview_enabled,
-            "num_views": self.num_views,
-            "num_streams": self.num_streams,
-            "camera_keys": list(self.multiview_camera_keys),
         }
 
     @staticmethod

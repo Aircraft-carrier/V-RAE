@@ -12,6 +12,21 @@ from vrae.data.lerobot import LeRobotVideoDataset
 from vrae.paths import ProjectPaths
 
 
+def flatten_multiview_video(video: torch.Tensor) -> torch.Tensor:
+    """Convert [B,T,V,C,H,W] clips to the single-view [B*V,T,C,H,W] layout."""
+
+    if video.ndim == 5:
+        return video
+    if video.ndim != 6:
+        raise ValueError(f"Expected [B,T,C,H,W] or [B,T,V,C,H,W], got {tuple(video.shape)}")
+    batch, time, views, channels, height, width = video.shape
+    return (
+        video.permute(0, 2, 1, 3, 4, 5)
+        .reshape(batch * views, time, channels, height, width)
+        .contiguous()
+    )
+
+
 class CudaVideoPrefetchIterator:
     """Overlap the next pinned-memory video transfer with the current training step."""
 
@@ -35,8 +50,6 @@ class CudaVideoPrefetchIterator:
             return
         with torch.cuda.stream(self.stream):
             batch["video"] = batch["video"].to(self.device, non_blocking=True)
-            if "stream_ids" in batch:
-                batch["stream_ids"] = batch["stream_ids"].to(self.device, non_blocking=True)
         self._next_batch = batch
 
     def __next__(self) -> dict[str, Any]:
@@ -46,8 +59,6 @@ class CudaVideoPrefetchIterator:
         current_stream = torch.cuda.current_stream(self.device)
         current_stream.wait_stream(self.stream)
         batch["video"].record_stream(current_stream)
-        if "stream_ids" in batch:
-            batch["stream_ids"].record_stream(current_stream)
         self._preload()
         return batch
 
@@ -82,10 +93,6 @@ def collate_reconstruction(items: list[dict[str, Any]]) -> dict[str, Any]:
             [int(item.get("decode_attempts", 1)) for item in items], dtype=torch.long
         ),
     }
-    if "stream_ids" in items[0]:
-        stream_ids = torch.stack([item["stream_ids"] for item in items])
-        if any(item["video"].ndim == 5 for item in items):
-            batch["stream_ids"] = stream_ids
     for key in ("state", "action"):
         if key in items[0]:
             batch[key] = torch.stack([item[key] for item in items])

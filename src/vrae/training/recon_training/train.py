@@ -40,7 +40,11 @@ from vrae.training.common.optim import build_optimizer, build_scheduler
 from vrae.training.common.precision import PrecisionPolicy
 from vrae.training.common.visualization import comparison_video
 from vrae.training.common.wandb import WandbLogger
-from vrae.training.recon_training.data import CudaVideoPrefetchIterator, build_reconstruction_loader
+from vrae.training.recon_training.data import (
+    CudaVideoPrefetchIterator,
+    build_reconstruction_loader,
+    flatten_multiview_video,
+)
 from vrae.training.recon_training.losses import ReconstructionLoss
 from vrae.training.recon_training.noise import add_reconstruction_noise
 from vrae.training.recon_training.sample import save_reconstruction_sample
@@ -55,15 +59,15 @@ class ReconstructionGraph(nn.Module):
         self.vrae = vrae
         self.noise_config = dict(noise_config)
 
-    def forward(self, video: torch.Tensor, stream_ids: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
-        clean = self.vrae.encode(video, stream_ids=stream_ids)
+    def forward(self, video: torch.Tensor) -> dict[str, torch.Tensor]:
+        clean = self.vrae.encode(video)
         train_latents = clean
         sigma = clean.new_zeros((*clean.shape[:2], *((1,) * (clean.ndim - 2))))
         if self.training and bool(self.noise_config.get("enabled", False)):
             train_latents, sigma = add_reconstruction_noise(
                 clean, float(self.noise_config.get("tau", 0.0))
             )
-        return {"recon": self.vrae.decode(train_latents, stream_ids=stream_ids), "latents": clean, "sigma": sigma}
+        return {"recon": self.vrae.decode(train_latents), "latents": clean, "sigma": sigma}
 
 
 def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -370,9 +374,7 @@ def train(
             if accumulation.is_first_microstep:
                 optimizer.zero_grad(set_to_none=True)
             video = prepare_batch(batch, context.device, config)
-            stream_ids = batch.get("stream_ids")
-            if stream_ids is not None and stream_ids.device != context.device:
-                stream_ids = stream_ids.to(context.device, non_blocking=True)
+            video = flatten_multiview_video(video)
             if context.is_main and fixed_video is None:
                 sample_count = min(int(config["wandb"].get("sample_count", 4)), video.shape[0])
                 fixed_video = video[:sample_count].detach().cpu()
@@ -389,8 +391,8 @@ def train(
                 torch.compiler.cudagraph_mark_step_begin()
             with accumulation.sync_context(graph):
                 with precision.autocast():
-                    result = graph(video, stream_ids=stream_ids)
-                    total, metrics = loss_module(result["recon"], video, stream_ids=stream_ids)
+                    result = graph(video)
+                    total, metrics = loss_module(result["recon"], video)
                 accumulation.backward(total, scaler)
             sampler.commit_batch()
             if not accumulation.advance():

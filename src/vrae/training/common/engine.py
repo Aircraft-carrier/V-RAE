@@ -98,6 +98,21 @@ def flow_transport_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def flatten_multiview_video(video: torch.Tensor) -> torch.Tensor:
+    """Keep the training model single-view by folding [B,T,V] into [B*V,T]."""
+
+    if video.ndim == 5:
+        return video
+    if video.ndim != 6:
+        raise ValueError(f"Expected [B,T,C,H,W] or [B,T,V,C,H,W], got {tuple(video.shape)}")
+    batch, time, views, channels, height, width = video.shape
+    return (
+        video.permute(0, 2, 1, 3, 4, 5)
+        .reshape(batch * views, time, channels, height, width)
+        .contiguous()
+    )
+
+
 def _training_progress_line(
     *,
     task: str,
@@ -429,10 +444,8 @@ def compute_class_conditional_latent_stats(
                 video = batch["video"].to(context.device, non_blocking=True)
                 if video.dtype == torch.uint8:
                     video = video.float().div_(255.0)
-                stream_ids = batch.get("stream_ids")
-                if stream_ids is not None:
-                    stream_ids = stream_ids.to(context.device, non_blocking=True)
-                stats.update(stage1.encode_grid(video, stream_ids=stream_ids))
+                video = flatten_multiview_video(video)
+                stats.update(stage1.encode_grid(video))
                 progress.update(1)
     finally:
         progress.close()
@@ -807,15 +820,35 @@ def train_class_conditional(
             video = batch["video"].to(context.device, non_blocking=True)
             if video.dtype == torch.uint8:
                 video = video.float().div_(255.0)
+            input_has_views = video.ndim == 6
+            multiview = input_has_views and bool(getattr(dit, "multiview_enabled", False))
+            views = int(video.shape[2]) if input_has_views else 1
+            flat_video = flatten_multiview_video(video)
             labels = batch["label"].to(context.device, non_blocking=True)
+            if not multiview and views > 1:
+                labels = labels.repeat_interleave(views)
             stream_ids = batch.get("stream_ids")
-            if stream_ids is not None:
+            if multiview and stream_ids is not None:
                 stream_ids = stream_ids.to(context.device, non_blocking=True)
+            else:
+                stream_ids = None
             if context.device.type == "cuda":
                 transfer_finished.record()
             with torch.no_grad():
-                grid = stage1.encode_grid(video, stream_ids=stream_ids)
-                clean = normalizer.normalize(stage1.grid_to_tokens(grid))
+                flat_grid = stage1.encode_grid(flat_video)
+                flat_tokens = stage1.grid_to_tokens(flat_grid)
+                if multiview:
+                    batch_size, _, tokens, channels = flat_tokens.shape
+                    clean = flat_tokens.reshape(
+                        batch_size // views,
+                        views,
+                        flat_tokens.shape[1],
+                        tokens,
+                        channels,
+                    ).permute(0, 2, 1, 3, 4).contiguous()
+                else:
+                    clean = flat_tokens
+                clean = normalizer.normalize(clean)
             if context.device.type == "cuda":
                 stage1_finished.record()
             with accumulation.sync_context(model):
@@ -1269,4 +1302,20 @@ def generate_class_conditional(
     )
     clean_tokens = normalizer.denormalize(normalized)
     clean_grid = stage1.tokens_to_grid(clean_tokens, height=grid_size[0], width=grid_size[1])
-    return stage1.decode_grid(clean_grid, stream_ids=stream_ids)
+    if multiview:
+        batch, time, views, channels, height, width = clean_grid.shape
+        flat_grid = (
+            clean_grid.permute(0, 2, 1, 3, 4, 5)
+            .reshape(batch * views, time, channels, height, width)
+            .contiguous()
+        )
+        decoded = stage1.decode_grid(flat_grid)
+        return decoded.reshape(
+            batch,
+            views,
+            decoded.shape[1],
+            decoded.shape[2],
+            decoded.shape[3],
+            decoded.shape[4],
+        ).permute(0, 2, 1, 3, 4, 5).contiguous()
+    return stage1.decode_grid(clean_grid)
