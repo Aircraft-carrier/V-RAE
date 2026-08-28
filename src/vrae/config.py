@@ -85,7 +85,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ConfigError("Only the temporal_attention pooler is registered")
     encoder = model.get("encoder")
     if isinstance(encoder, Mapping) and "name" in encoder:
-        allowed = {"dinov3", "siglip2", "eupe", "vjepa2_1"}
+        allowed = {"vjepa2_1"}
         encoder_name = str(encoder["name"])
         if encoder_name not in allowed:
             raise ConfigError(
@@ -210,12 +210,6 @@ def validate_config(config: Mapping[str, Any]) -> None:
     stage1 = config.get("stage1", {})
     if isinstance(stage1, Mapping):
         _checkpoint_relative_to_project(stage1.get("checkpoint"), "stage1.checkpoint")
-    latent_normalizer = config.get("latent_normalizer", {})
-    if isinstance(latent_normalizer, Mapping):
-        _checkpoint_relative_to_project(
-            latent_normalizer.get("path"),
-            "latent_normalizer.path",
-        )
     loss = config.get("loss", {})
     if isinstance(loss, Mapping):
         if "perceptual_frames" in loss and int(loss["perceptual_frames"]) <= 0:
@@ -238,12 +232,6 @@ def validate_config(config: Mapping[str, Any]) -> None:
         _checkpoint_relative_to_project(
             loss.get("calibration_checkpoint"),
             "loss.calibration_checkpoint",
-        )
-    gan = config.get("gan", {})
-    if isinstance(gan, Mapping):
-        _checkpoint_relative_to_project(
-            gan.get("discriminator_checkpoint"),
-            "gan.discriminator_checkpoint",
         )
 
 

@@ -25,7 +25,7 @@ class LeRobotVideoDataset(LeRobotDataset):
         self,
         root: str | Path,
         *,
-        repo_id: str = "libero",
+        repo_id: str = "your-org/your-lerobot-dataset",
         clip_length: int = 16,
         frame_interval: int = 1,
         sampling: ClipSamplingMode = "random",
@@ -150,8 +150,6 @@ class LeRobotVideoDataset(LeRobotDataset):
             ).reshape(video.shape[0], video.shape[1], 3, self.image_size, self.image_size)
         if self.random_flip and bool(torch.rand((), generator=self._generator(index)) < 0.5):
             video = video.flip(-1)
-        state = torch.stack([row["observation.state"] for row in rows])
-        action = torch.stack([row["action"] for row in rows])
         task = rows[0].get("task", "")
         output_video = video if self.multiview_enabled else video[:, 0]
         result: dict[str, Any] = {
@@ -163,11 +161,17 @@ class LeRobotVideoDataset(LeRobotDataset):
             "video_metadata": {"fps": self.clip_fps, "num_frames": stop - start,
                                 "height": int(output_video.shape[-2]), "width": int(output_video.shape[-1]),
                                 "channels": int(output_video.shape[-3]), "num_views": self.num_views},
-            "state": state,
-            "action": action,
             "task": task,
-            "extra": {"episode_index": episode, "task": task, "state": state, "action": action},
+            "extra": {"episode_index": episode, "task": task},
         }
+        if all("observation.state" in row for row in rows):
+            state = torch.stack([row["observation.state"] for row in rows])
+            result["state"] = state
+            result["extra"]["state"] = state
+        if all("action" in row for row in rows):
+            action = torch.stack([row["action"] for row in rows])
+            result["action"] = action
+            result["extra"]["action"] = action
         if self.multiview_enabled:
             result["stream_ids"] = self.stream_ids.clone()
         return result
