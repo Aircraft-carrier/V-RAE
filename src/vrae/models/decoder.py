@@ -460,16 +460,6 @@ class VRAEDecoder(nn.Module):
         return self.depatchify(predicted, chunks=chunks, height=height, width=width)
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        if latents.ndim == 6:
-            batch, chunks, views, channels, height, width = latents.shape
-            flattened = latents.permute(0, 2, 1, 3, 4, 5).reshape(
-                batch * views, chunks, channels, height, width
-            )
-            decode_fn = self._compiled_forward or self._forward_impl
-            decoded = decode_fn(flattened)
-            return decoded.reshape(
-                batch, views, decoded.shape[1], decoded.shape[2], decoded.shape[3], decoded.shape[4]
-            ).permute(0, 2, 1, 3, 4, 5).contiguous()
         return (
             self._compiled_forward(latents)
             if self._compiled_forward is not None
