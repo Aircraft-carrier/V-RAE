@@ -536,7 +536,7 @@ def build_class_conditional_dit(
     multiview = config.get("model", {}).get("multiview", {})
     if isinstance(multiview, Mapping):
         dit_config.setdefault("multiview_enabled", bool(multiview.get("enabled", False)))
-        for key in ("num_views", "num_streams", "use_view_embedding"):
+        for key in ("num_views",):
             if key in multiview:
                 dit_config.setdefault(key, multiview[key])
     dit_config.pop("input_dim", None)

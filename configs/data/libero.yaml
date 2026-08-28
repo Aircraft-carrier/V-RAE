@@ -2,8 +2,6 @@ model:
   multiview:
     enabled: true
     num_views: 2
-    num_streams: 2
-    use_view_embedding: true
 data:
   dataset: lerobot
   root: /zsh/cache/data/Lerobot/libero
