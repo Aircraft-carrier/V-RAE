@@ -17,7 +17,6 @@ from vrae.models.dit.blocks import (
     VideoDiTRoPECache,
     embed_video_frames,
     unpatchify_video_tokens,
-    video_tokens_to_grid,
 )
 from vrae.models.dit.conditioning import LabelConditionAdapter
 from vrae.models.rope3d import (
@@ -349,6 +348,242 @@ class VRAEVideoDiT(nn.Module):
             channels=self.in_channels,
         )
 
+    def _prepare_input_grid(
+        self,
+        noisy: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[int, ...], int]:
+        """Convert token latents to the shared ``[B*V,T,C,H,W]`` path.
+
+        Returns:
+            grid: [B*V*T,C,H,W] tensor
+            shape: original noisy shape
+            views: number of views V
+        """
+        views = self.num_views if self.multiview_enabled else 1
+        if not self.multiview_enabled:
+            noisy = noisy.unsqueeze(2)
+        batch = noisy.shape[0]
+        # [B, K, V, N, C]
+        #   -> [B, V, K, N, C]
+        tokens = noisy.permute(0, 2, 1, 3, 4).contiguous()
+        # [B, V, K, N, C]
+        #   -> [B*V, K, H, W, C]
+        tokens = tokens.reshape(
+            batch * views,
+            self.num_chunks,
+            *self.grid_size,
+            self.in_channels,
+        )
+        # [B*V, K, H, W, C]
+        #   -> permute(0, 1, 4, 2, 3)
+        # [B*V, K, C, H, W]
+        #
+        # 然后把 B*V 和 K 合并：
+        # [B*V, K, C, H, W]
+        #   -> [B*V*K, C, H, W]
+        grid = tokens.permute(0, 1, 4, 2, 3).reshape(
+            batch * views * self.num_chunks,
+            self.in_channels,
+            *self.grid_size,
+        )
+        return grid, tuple(noisy.shape), views
+
+    def _validate_forward_inputs(
+        self,
+        noisy: torch.Tensor,
+        time: torch.Tensor,
+        labels: torch.Tensor | None,
+        context: torch.Tensor | None,
+        condition_drop_mask: torch.Tensor | None,
+        class_drop_mask: torch.Tensor | None,
+        stream_ids: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Validate and normalize forward inputs without preparing the latent grid."""
+        if not self.multiview_enabled:
+            if noisy.ndim != 4:
+                raise ValueError(
+                    f"noisy must have shape [B,{self.num_chunks},N,C]"
+                )
+        else:
+            expected_shape = (self.num_chunks, self.num_views)
+            if noisy.ndim != 5 or tuple(noisy.shape[1:3]) != expected_shape:
+                raise ValueError(
+                    f"noisy must have shape [B,{self.num_chunks},{self.num_views},N,C]"
+                )
+        if tuple(noisy.shape[-2:]) != (
+            self.tokens_per_chunk,
+            self.in_channels,
+        ):
+            raise ValueError("noisy token grid has incorrect patch shape")
+        if not noisy.is_floating_point():
+            raise TypeError("noisy must be floating point")
+
+        if labels is None:
+            labels = context
+        elif context is not None:
+            raise ValueError("pass class labels as either labels or context, not both")
+        if labels is None:
+            raise ValueError("class labels are required")
+        if condition_drop_mask is not None and class_drop_mask is not None:
+            raise ValueError("pass only one of condition_drop_mask or class_drop_mask")
+        batch_size = noisy.shape[0]
+        if time.ndim == 0:
+            time = time.expand(batch_size)
+        if time.ndim != 1 or time.shape[0] != batch_size:
+            raise ValueError(f"time must have shape [{batch_size}], got {tuple(time.shape)}")
+        if labels.shape != (batch_size,):
+            raise ValueError(f"labels must have shape [{batch_size}], got {tuple(labels.shape)}")
+        if self.multiview_enabled:
+            if stream_ids is None:
+                stream_ids = torch.arange(self.num_views, device=noisy.device).expand(
+                    batch_size, self.num_views
+                )
+            if stream_ids.shape != (batch_size, self.num_views):
+                raise ValueError(f"stream_ids must have shape [{batch_size},{self.num_views}]")
+            if stream_ids.min() < 0 or stream_ids.max() >= self.num_streams:
+                raise ValueError("stream_ids are outside num_streams")
+        drop_mask = (
+            class_drop_mask
+            if class_drop_mask is not None
+            else condition_drop_mask
+        )
+        return noisy, time, labels, drop_mask, stream_ids
+
+    def _build_positions(self, base: torch.Tensor, *, patches: int, views: int) -> torch.Tensor:
+        if views == 1:
+            return base
+        # [T * P, 3]
+        #     -> [T, P, 3]
+        #
+        # `[:, None]`：
+        # [T, P, 3]
+        #     -> [T, 1, P, 3]
+        #
+        # `expand(-1, views, -1, -1)`：
+        # [T, 1, P, 3]
+        #     -> [T, V, P, 3]
+        #
+        # [T, V, P, 3]
+        #     -> [T * V * P, 3]
+        return (
+            base.reshape(self.num_chunks, patches, 3)[:, None]
+            .expand(-1, views, -1, -1)
+            .reshape(-1, 3)
+        )
+
+    def _embed_sequence(
+        self,
+        embedder: FramePatchEmbed,
+        view_embedding: nn.Embedding,
+        grid: torch.Tensor,
+        shape: tuple[int, ...],
+        views: int,
+        stream_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed a prepared latent grid and add view-specific embeddings.
+        """
+        # P = Ph*Pw = number of patches per chunk
+        # D = embedding dimension
+        batch = shape[0]
+        # [B*V*T,C,H,W]
+        #   -> [B*V*T,D,Ph,Pw]
+        #   -> [B*V*T,P,D]
+        #   -> [B*V,T*P, D]
+        sequence = embed_video_frames(
+            embedder,
+            grid,
+            batch_size=batch * views,
+            chunks=self.num_chunks,
+        )
+
+        # sequence.shape:
+        # [B*V, T*P, D]
+        patches = sequence.shape[1] // self.num_chunks
+
+        # Only multiview inputs require the following steps:
+        # 1. Split B and V
+        # 2. Reorder the tokens
+        # 3. Add view-specific embeddings
+        # 4. Flatten back into a Transformer sequence
+        if views > 1:
+            # [B*V, T*P, D]
+            #     -> [B, V, T, P, D]
+            sequence = sequence.reshape(
+                batch,
+                views,
+                self.num_chunks,
+                patches,
+                sequence.shape[-1],
+            )
+
+            # [B, V, T, P, D]
+            #     -> [B, T, V, P, D]
+            # The final token order is chunk, view, then patch.
+            sequence = sequence.permute(0, 2, 1, 3, 4)
+
+            if stream_ids is None:
+                raise ValueError(
+                    "stream_ids are required for multiview embedding"
+                )
+
+            # stream_ids:
+            # [B, V]
+            #
+            # view_embedding(stream_ids):
+            # [B, V] -> [B, V, D]
+            #
+            # After adding two dimensions of length 1:
+            # [B, V, D] -> [B, 1, V, 1, D]
+            #
+            # When added to [B, T, V, P, D], broadcasting applies the same
+            # view embedding to all chunks and patches of that view.
+            view_bias = view_embedding(stream_ids).to(sequence.dtype)
+            sequence = sequence + view_bias[:, None, :, None]
+
+            # [B, T, V, P, D]
+            #     -> [B, T*V*P, D]
+            sequence = sequence.reshape(
+                batch,
+                -1,
+                sequence.shape[-1],
+            )
+
+        # For a single view, sequence remains:
+        # [B, T*P, D]
+        #
+        # For multiple views, sequence has been reshaped to:
+        # [B, T*V*P, D]
+
+        base_positions = (
+            self._encoder_positions
+            if embedder is self.encoder_embed
+            else self._decoder_positions
+        )
+
+        return sequence, self._build_positions(
+            base_positions,
+            patches=patches,
+            views=views,
+        )
+
+
+    def _restore_output(self, tokens: torch.Tensor, *, batch: int, views: int) -> torch.Tensor:
+        if views == 1:
+            return self._unpatchify(tokens, batch_size=batch)
+        tokens = tokens.reshape(batch, self.num_chunks, views, self.patches_per_chunk, -1)
+        tokens = tokens.permute(0, 2, 1, 3, 4).reshape(
+            batch * views, self.num_chunks * self.patches_per_chunk, -1
+        )
+        restored = self._unpatchify(tokens, batch_size=batch * views)
+        restored = restored.reshape(batch, views, self.num_chunks, self.patches_per_chunk, -1)
+        return restored.permute(0, 2, 1, 3, 4).contiguous()
+
     def forward(
         self,
         noisy: torch.Tensor,
@@ -363,93 +598,16 @@ class VRAEVideoDiT(nn.Module):
         return_base: bool = False,
         return_intermediate: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[Any, torch.Tensor]:
-        if labels is None:
-            labels = context
-        elif context is not None:
-            raise ValueError("pass class labels as either labels or context, not both")
-        if labels is None:
-            raise ValueError("class labels are required")
-        if condition_drop_mask is not None and class_drop_mask is not None:
-            raise ValueError("pass only one of condition_drop_mask or class_drop_mask")
-        if class_drop_mask is not None:
-            drop_mask = class_drop_mask
-        else:
-            drop_mask = condition_drop_mask
-        multiview = self.multiview_enabled
-        if multiview:
-            if (
-                noisy.ndim != 5
-                or tuple(noisy.shape[1:3]) != (self.num_chunks, self.num_views)
-            ):
-                raise ValueError(
-                    f"noisy must have shape [B,{self.num_chunks},{self.num_views},N,C]"
-                )
-
-            batch = noisy.shape[0]
-            expected_tokens = self.grid_size[0] * self.grid_size[1]
-
-            if tuple(noisy.shape[3:]) != (
-                expected_tokens,
-                self.in_channels,
-            ):
-                raise ValueError("noisy token grid has incorrect patch shape")
-
-            grid = (
-                noisy.permute(0, 2, 1, 3, 4)
-                .contiguous()
-                .reshape(
-                    batch * self.num_views,
-                    self.num_chunks,
-                    expected_tokens,
-                    self.in_channels,
-                )
-            )
-
-            grid = grid.reshape(
-                batch * self.num_views,
-                self.num_chunks,
-                self.grid_size[0],
-                self.grid_size[1],
-                self.in_channels,
-            )
-
-            grid = (
-                grid.permute(0, 1, 4, 2, 3)
-                .reshape(
-                    batch * self.num_views * self.num_chunks,
-                    self.in_channels,
-                    *self.grid_size,
-                )
-            )
-        else:
-            grid, batch = video_tokens_to_grid(
-                noisy,
-                chunks=self.num_chunks,
-                grid_size=self.grid_size,
-                channels=self.in_channels,
-                name="noisy",
-            )
-
-        if time.ndim == 0:
-            time = time.expand(batch)
-        if time.ndim != 1 or time.shape[0] != batch:
-            raise ValueError(f"time must have shape [{batch}], got {tuple(time.shape)}")
-        if labels.shape != (batch,):
-            raise ValueError(
-                f"labels must have shape [{batch}], got {tuple(labels.shape)}"
-            )
-        if multiview:
-            if stream_ids is None:
-                stream_ids = torch.arange(
-                    self.num_views,
-                    device=noisy.device,
-                ).expand(batch, self.num_views)
-            if stream_ids.shape != (batch, self.num_views):
-                raise ValueError(
-                    f"stream_ids must have shape [{batch},{self.num_views}]"
-                )
-            if stream_ids.min() < 0 or stream_ids.max() >= self.num_streams:
-                raise ValueError("stream_ids are outside num_streams")
+        noisy, time, labels, drop_mask, stream_ids = self._validate_forward_inputs(
+            noisy,
+            time,
+            labels,
+            context,
+            condition_drop_mask,
+            class_drop_mask,
+            stream_ids,
+        )
+        grid, shape, views = self._prepare_input_grid(noisy)
 
         time_embedding = self.time_embedder(time.to(noisy.device))
         label_embedding, _, _ = self.condition_adapter.prepare(
@@ -461,53 +619,14 @@ class VRAEVideoDiT(nn.Module):
             time_embedding.dtype
         )
 
-        if multiview:
-            embed_batch_size = batch * self.num_views
-        else:
-            embed_batch_size = batch
-
-        sequence = embed_video_frames(
+        sequence, encoder_positions = self._embed_sequence(
             self.encoder_embed,
+            self.encoder_view_embedding,
             grid,
-            batch_size=embed_batch_size,
-            chunks=self.num_chunks,
+            shape,
+            views,
+            stream_ids,
         )
-
-        if multiview:
-            patches = sequence.shape[1] // self.num_chunks
-
-            sequence = sequence.reshape(
-                batch,
-                self.num_views,
-                self.num_chunks,
-                patches,
-                sequence.shape[-1],
-            )
-
-            sequence = sequence.permute(0, 2, 1, 3, 4)
-
-            ids = stream_ids
-
-            sequence = sequence + (
-                self.encoder_view_embedding(ids)
-                .to(sequence.dtype)[:, None, :, None]
-            )
-
-            sequence = sequence.reshape(
-                batch,
-                -1,
-                sequence.shape[-1],
-            )
-
-            encoder_positions = (
-                self._encoder_positions
-                .reshape(self.num_chunks, patches, 3)[:, None]
-                .expand(-1, self.num_views, -1, -1)
-                .reshape(-1, 3)
-            )
-
-        else:
-            encoder_positions = self._encoder_positions
 
         encoder_rope_cache = self._cached_rope(
             scope="encoder",
@@ -515,6 +634,7 @@ class VRAEVideoDiT(nn.Module):
             hidden=sequence,
             block=self.encoder_blocks[0],
         )
+
         base_sequence: torch.Tensor | None = None
         for index, block in enumerate(self.encoder_blocks, start=1):
             sequence = self._run_conditioned_block(
@@ -532,48 +652,14 @@ class VRAEVideoDiT(nn.Module):
         decoder_condition = self.encoder_to_decoder(
             F.silu(time_embedding + sequence)
         )
-        decoder_sequence = embed_video_frames(
+        decoder_sequence, decoder_positions = self._embed_sequence(
             self.decoder_embed,
+            self.decoder_view_embedding,
             grid,
-            batch_size=embed_batch_size,
-            chunks=self.num_chunks,
+            shape,
+            views,
+            stream_ids,
         )
-
-        if multiview:
-            patches = decoder_sequence.shape[1] // self.num_chunks
-
-            decoder_sequence = decoder_sequence.reshape(
-                batch,
-                self.num_views,
-                self.num_chunks,
-                patches,
-                decoder_sequence.shape[-1],
-            )
-
-            decoder_sequence = decoder_sequence.permute(0, 2, 1, 3, 4)
-
-            ids = stream_ids
-
-            decoder_sequence = decoder_sequence + (
-                self.decoder_view_embedding(ids)
-                .to(decoder_sequence.dtype)[:, None, :, None]
-            )
-
-            decoder_sequence = decoder_sequence.reshape(
-                batch,
-                -1,
-                decoder_sequence.shape[-1],
-            )
-
-            decoder_positions = (
-                self._decoder_positions
-                .reshape(self.num_chunks, patches, 3)[:, None]
-                .expand(-1, self.num_views, -1, -1)
-                .reshape(-1, 3)
-            )
-
-        else:
-            decoder_positions = self._decoder_positions
 
         decoder_rope_cache = self._cached_rope(
             scope="decoder",
@@ -581,6 +667,7 @@ class VRAEVideoDiT(nn.Module):
             hidden=decoder_sequence,
             block=self.decoder_blocks[0],
         )
+
         for block in self.decoder_blocks:
             decoder_sequence = self._run_conditioned_block(
                 block,
@@ -592,47 +679,16 @@ class VRAEVideoDiT(nn.Module):
         full_tokens = self.final_layer(decoder_sequence, decoder_condition)
         base_condition = F.silu(time_embedding + base_sequence)
         base_tokens = self.base_final_layer(base_condition, base_condition)
-        if multiview:
-
-            def restore(tokens: torch.Tensor) -> torch.Tensor:
-                tokens = tokens.reshape(
-                    batch,
-                    self.num_chunks,
-                    self.num_views,
-                    self.patches_per_chunk,
-                    -1,
-                )
-                tokens = tokens.permute(
-                    0,
-                    2,
-                    1,
-                    3,
-                    4,
-                ).reshape(
-                    batch * self.num_views,
-                    self.num_chunks * self.patches_per_chunk,
-                    -1,
-                )
-                restored = self._unpatchify(tokens, batch_size=batch * self.num_views)
-                restored = restored.reshape(
-                    batch,
-                    self.num_views,
-                    self.num_chunks,
-                    self.patches_per_chunk,
-                    -1,
-                )
-                return restored.permute(
-                    0,
-                    2,
-                    1,
-                    3,
-                    4,
-                ).contiguous()
-            full = restore(full_tokens)
-            base = restore(base_tokens)
-        else:
-            full = self._unpatchify(full_tokens, batch_size=batch)
-            base = self._unpatchify(base_tokens, batch_size=batch)
+        full = self._restore_output(
+            full_tokens,
+            batch=shape[0],
+            views=views,
+        )
+        base = self._restore_output(
+            base_tokens,
+            batch=shape[0],
+            views=views,
+        )
         result: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
         if return_base:
             result = (full, base)
