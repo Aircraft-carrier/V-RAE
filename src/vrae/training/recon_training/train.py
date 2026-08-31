@@ -28,6 +28,7 @@ from vrae.training.common.contracts import (
     validate_checkpoint_identity,
 )
 from vrae.training.common.distributed import (
+    barrier,
     configure_ddp_gradient_compression,
     gather_rng_states,
     initialize_distributed,
@@ -265,6 +266,16 @@ def train(
     loader, sampler = loader_builder(
         config, paths, rank=context.rank, world_size=context.world_size
     )
+    class_map_path = run / "class_map.json"
+    if context.is_main and not class_map_path.is_file():
+        loader.dataset.save_class_map(class_map_path)
+    barrier()
+    class_map = loader.dataset.load_class_map(class_map_path)
+    map_num_classes = int(class_map.get("num_classes", len(class_map["class_names"])))
+    if map_num_classes != len(class_map["class_names"]):
+        raise ValueError("class_map.json has an inconsistent num_classes field")
+    if map_num_classes != loader.dataset.num_classes:
+        raise ValueError("class_map.json does not match the dataset metadata")
     prepare_batch = batch_preparer or (
         lambda batch, device, _config: batch["video"].to(device, non_blocking=True)
     )
@@ -362,7 +373,6 @@ def train(
     execution_metadata_recorded = False
     stop = False
     for epoch in range(start_epoch, int(config["training"]["epochs"])):
-        loader.dataset.set_epoch(epoch)
         batches = iter(loader)
         if (
             batch_preparer is None

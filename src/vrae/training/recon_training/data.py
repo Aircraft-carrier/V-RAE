@@ -67,19 +67,11 @@ def build_reconstruction_dataset(config: Mapping[str, Any], paths: ProjectPaths)
     data = config["data"]
     root_value = data.get("root")
     root = paths.dataset("lerobot") if not root_value else str(root_value)
-    multiview = config.get("model", {}).get("multiview", {})
     return LeRobotVideoDataset(
         root,
         repo_id=str(data.get("repo_id", "libero")),
-        clip_length=int(data.get("num_frames", 16)),
-        frame_interval=int(data.get("frame_interval", 1)),
-        sampling=str(data.get("sampling", "random")),
-        base_seed=int(data.get("seed", 3407)),
+        frame_num=int(data.get("num_frames", 16)),
         camera_keys=data.get("camera_keys"),
-        image_size=int(data.get("image_size", 256)),
-        random_flip=bool(data.get("random_flip", False)),
-        multiview_enabled=bool(multiview.get("enabled", False)),
-        class_suites=data.get("class_suites"),
     )
 
 
@@ -98,6 +90,8 @@ def collate_reconstruction(items: list[dict[str, Any]]) -> dict[str, Any]:
             batch[key] = torch.stack([item[key] for item in items])
     if "task" in items[0]:
         batch["task"] = [item["task"] for item in items]
+    if "prompt" in items[0]:
+        batch["prompt"] = [item["prompt"] for item in items]
     return batch
 
 

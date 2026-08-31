@@ -1,6 +1,5 @@
-"""LeRobot video sampling used by the V-JEPA 2.1 trainer."""
+"""Self-contained LeRobot v3 data loading for V-RAE training."""
 
 from .lerobot import LeRobotVideoDataset
-from .sampling import ClipSampler, ClipSamplingMode
 
-__all__ = ["ClipSampler", "ClipSamplingMode", "LeRobotVideoDataset"]
+__all__ = ["LeRobotVideoDataset"]

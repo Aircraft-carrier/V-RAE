@@ -257,25 +257,13 @@ class ClassConditionalVideoDataset:
         from vrae.data.lerobot import LeRobotVideoDataset
 
         data = config["data"]
-        multiview = config.get("model", {}).get("multiview", {})
         root_value = data.get("root")
         root = Path(str(root_value)).expanduser() if root_value else paths.dataset("lerobot")
         return LeRobotVideoDataset(
             root,
             repo_id=str(data.get("repo_id", "libero")),
-            clip_length=int(data["num_frames"]),
-            frame_interval=int(data.get("frame_interval", 1)),
-            sampling=str(data.get("sampling", "random")),
-            base_seed=int(data.get("seed", 3407)),
+            frame_num=int(data["num_frames"]),
             camera_keys=data.get("camera_keys"),
-            image_size=(
-                int(data["image_size"])
-                if data.get("image_size") is not None
-                else None
-            ),
-            random_flip=bool(data.get("random_flip", False)),
-            multiview_enabled=bool(multiview.get("enabled", True)),
-            class_suites=data.get("class_suites"),
         )
 
 
@@ -570,7 +558,6 @@ def class_conditional_metadata(
         "dit_multiview_enabled": bool(getattr(dit, "multiview_enabled", False)),
         "dit_num_views": int(getattr(dit, "num_views", 1)),
         "dit_num_streams": int(getattr(dit, "num_streams", 1)),
-        "dit_class_suites": [dict(item) for item in config["data"]["class_suites"]],
         **dit_architecture_metadata(dit),
         "transport": flow_transport_metadata(config),
         "latent_normalizer_identity": (
@@ -621,6 +608,25 @@ def train_class_conditional(
     seed_everything(int(config["data"].get("seed", 3407)), rank=context.rank)
     stage1, stage1_checkpoint_payload = load_frozen_stage1(config, paths, context.device)
     del stage1_checkpoint_payload
+    loader, sampler = build_class_conditional_loader(
+        config,
+        paths,
+        dataset_name=dataset_name,
+        rank=context.rank,
+        world_size=context.world_size,
+    )
+    class_map_path = run / "class_map.json"
+    if context.is_main and not class_map_path.is_file():
+        loader.dataset.save_class_map(class_map_path)
+    barrier()
+    class_map = loader.dataset.load_class_map(class_map_path)
+    map_num_classes = int(class_map.get("num_classes", len(class_map["class_names"])))
+    if map_num_classes != len(class_map["class_names"]):
+        raise ValueError("class_map.json has an inconsistent num_classes field")
+    if map_num_classes != loader.dataset.num_classes:
+        raise ValueError("class_map.json does not match the dataset metadata")
+    if map_num_classes != int(config["dit"]["num_classes"]):
+        raise ValueError("dit.num_classes must match the dataset class map")
     num_chunks = int(config["data"]["num_frames"]) // 4
     dit = build_class_conditional_dit(config, stage1.metadata(), num_chunks=num_chunks).to(
         context.device
@@ -661,14 +667,7 @@ def train_class_conditional(
     )
     scaler = precision.make_scaler()
     transport = build_flow_transport(config)
-    loader, sampler = build_class_conditional_loader(
-        config,
-        paths,
-        dataset_name=dataset_name,
-        rank=context.rank,
-        world_size=context.world_size,
-    )
-    metadata["dit_class_names"] = list(loader.dataset.class_names)
+    metadata["dit_class_names"] = list(class_map["class_names"])
     accumulation = GradientAccumulator(
         int(config["training"].get("gradient_accumulation_steps", 1))
     )
@@ -801,7 +800,6 @@ def train_class_conditional(
     cuda_batch_events: list[tuple[torch.cuda.Event, ...]] = []
     cuda_update_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
     for epoch in range(start_epoch, epochs):
-        loader.dataset.set_epoch(epoch)
         batch_requested_at = time.perf_counter()
         for batch in loader:
             batch_received_at = time.perf_counter()

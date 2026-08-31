@@ -138,52 +138,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
             )
             if enabled and int(multiview.get("num_views", len(cameras))) != len(cameras):
                 raise ConfigError("model.multiview.num_views must equal len(data.camera_keys)")
-            keys: set[str] = set()
-            ids: set[int] = set()
-            for index, camera in enumerate(cameras):
-                if isinstance(camera, str):
-                    key, stream_id = camera, index
-                elif isinstance(camera, Mapping) and "key" in camera:
-                    key, stream_id = str(camera["key"]), int(camera.get("stream_id", index))
-                else:
-                    raise ConfigError("each data.camera_keys entry requires key")
-                if key in keys or stream_id in ids or stream_id < 0:
-                    raise ConfigError("data.camera_keys keys and stream_id values must be unique")
-                keys.add(key)
-                ids.add(stream_id)
-            class_suites = data.get("class_suites")
-            if class_suites is not None:
-                if (
-                    not isinstance(class_suites, Sequence)
-                    or isinstance(class_suites, (str, bytes))
-                    or not class_suites
-                ):
-                    raise ConfigError("data.class_suites must be a non-empty list")
-                suite_names: set[str] = set()
-                task_indices: set[int] = set()
-                for suite in class_suites:
-                    if not isinstance(suite, Mapping):
-                        raise ConfigError("each data.class_suites entry must be a mapping")
-                    suite_name = str(suite.get("name", "")).strip()
-                    indices = suite.get("task_indices")
-                    if not suite_name or suite_name in suite_names:
-                        raise ConfigError("data.class_suites names must be non-empty and unique")
-                    if (
-                        not isinstance(indices, Sequence)
-                        or isinstance(indices, (str, bytes))
-                        or not indices
-                    ):
-                        raise ConfigError(
-                            f"data.class_suites[{suite_name!r}].task_indices must be non-empty"
-                        )
-                    suite_names.add(suite_name)
-                    for value in indices:
-                        task_index = int(value)
-                        if task_index < 0 or task_index in task_indices:
-                            raise ConfigError(
-                                "data.class_suites task_indices must be unique and non-negative"
-                            )
-                        task_indices.add(task_index)
+            if any(not isinstance(camera, Mapping) or "key" not in camera for camera in cameras):
+                raise ConfigError("each data.camera_keys entry must be a mapping with key")
     training = config.get("training", {})
     if isinstance(training, Mapping) and training.get("resume") and training.get("init_from"):
         raise ConfigError("training.resume and training.init_from are mutually exclusive")

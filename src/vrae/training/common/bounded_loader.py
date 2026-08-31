@@ -306,6 +306,8 @@ class BoundedThreadBatchLoader:
                 batch[key] = torch.stack([item[key] for item in items])
         if "task" in items[0]:
             batch["task"] = [item["task"] for item in items]
+        if "prompt" in items[0]:
+            batch["prompt"] = [item["prompt"] for item in items]
         return batch
 
     def _iterate(self) -> Iterator[dict[str, Any]]:

@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from vrae.config import load_config
-from vrae.libero import LiberoClassMap
 from vrae.paths import ProjectPaths, find_project_root, load_project_paths
 from vrae.training.common.engine import (
     compute_class_conditional_latent_stats,
@@ -16,34 +15,6 @@ from vrae.training.common.engine import (
     prepare_run,
     train_class_conditional,
 )
-
-
-EXPECTED_SUITES = (
-    "libero_10",
-    "libero_goal",
-    "libero_object",
-    "libero_spatial",
-)
-EXPECTED_TASK_INDICES = tuple(range(40))
-
-
-def build_class_map(config: Mapping[str, Any]) -> LiberoClassMap:
-    suites = config["data"].get("class_suites")
-    if not isinstance(suites, Sequence) or isinstance(suites, (str, bytes)):
-        raise ValueError("LIBERO generation requires data.class_suites")
-    class_map = LiberoClassMap.from_config(
-        suites,
-        available_task_indices=EXPECTED_TASK_INDICES,
-    )
-    suite_names = tuple(str(item["name"]) for item in suites)
-    if suite_names != EXPECTED_SUITES:
-        raise ValueError(
-            "data.class_suites must be ordered as "
-            f"{EXPECTED_SUITES}, got {suite_names}"
-        )
-    if any(len(item["task_indices"]) != 10 for item in suites):
-        raise ValueError("each standard LIBERO suite must contain exactly 10 tasks")
-    return class_map
 
 
 def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -55,11 +26,11 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     if config["data"].get("dataset") != "lerobot":
         raise ValueError("LIBERO generation requires data.dataset=lerobot")
 
-    class_map = build_class_map(config)
-    if int(config["dit"]["num_classes"]) != len(class_map):
-        raise ValueError("dit.num_classes must equal the 40 LIBERO suite/task classes")
+    num_classes = int(config["dit"]["num_classes"])
+    if num_classes <= 0:
+        raise ValueError("dit.num_classes must be positive")
     sample_class_ids = [int(value) for value in config["sampling"].get("class_ids", [])]
-    if any(value < 0 or value >= len(class_map) for value in sample_class_ids):
+    if any(value < 0 or value >= num_classes for value in sample_class_ids):
         raise ValueError("sampling.class_ids must reference valid LIBERO classes")
 
     num_frames = int(config["data"]["num_frames"])
@@ -93,8 +64,7 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "task": config["task"],
         "dataset": "lerobot",
-        "num_classes": len(class_map),
-        "suites": list(EXPECTED_SUITES),
+        "num_classes": num_classes,
         "num_chunks": num_chunks,
         "num_views": num_views,
         "transport": transport,

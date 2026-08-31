@@ -1,230 +1,169 @@
-"""LeRobot v3 dataset with V-RAE clip sampling."""
+"""LeRobot v3 dataset adapter for V-JEPA 2.1 video inputs."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import torch
+from torchvision import transforms
 
-from vrae.libero import LiberoClass, LiberoClassMap
+from .dataset_utils import CenterCrop, ResizeSmallestSideAspectPreserving
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from .sampling import ClipSampler, ClipSamplingMode
+from .lerobot3.lerobot_dataset import LeRobotDataset
+
+DEFAULT_PROMPT = (
+    "A video recorded from a robot's point of view executing the following instruction: {task}"
+)
 
 
 class LeRobotVideoDataset(LeRobotDataset):
-    """Sample synchronized episodes while retaining native LeRobot interfaces."""
+    """Expose LeRobot's native frame loader as V-JEPA 2.1 video samples.
+
+    ``video`` is returned as ``[T,C,H,W]`` for one view or ``[T,V,C,H,W]``
+    for multiple views, with float32 RGB values in ``[0, 1]``.
+    """
 
     def __init__(
         self,
         root: str | Path,
         *,
         repo_id: str = "libero",
-        clip_length: int = 16,
-        frame_interval: int = 1,
-        sampling: ClipSamplingMode = "random",
-        base_seed: int = 0,
-        camera_keys: Sequence[str | Mapping[str, Any]] | None = None,
-        image_size: int | None = None,
-        random_flip: bool = False,
-        multiview_enabled: bool | None = None,
-        class_suites: Sequence[Mapping[str, Any]] | None = None,
+        frame_num: int = 16,
+        camera_keys: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
-        super().__init__(repo_id, root=Path(root), download_videos=False)
-        self.sampler = ClipSampler(clip_length, frame_interval, sampling)
-        self.base_seed = int(base_seed)
-        self.epoch = 0
-        self.image_size = None if image_size is None else int(image_size)
-        if self.image_size is not None and self.image_size <= 0:
-            raise ValueError("image_size must be positive")
-        self.random_flip = bool(random_flip)
-        self.camera_keys = self._resolve_camera_keys(camera_keys)
-        self.multiview_enabled = (
-            len(self.camera_keys) > 1 if multiview_enabled is None else bool(multiview_enabled)
+        super().__init__(repo_id, root=Path(root))
+        # Match FastWAM's resize-then-center-crop policy while keeping
+        # V-RAE's expected float RGB range [0, 1].
+        self.image_transforms = transforms.Compose(
+            [
+                ResizeSmallestSideAspectPreserving(
+                    args={"img_w": 256, "img_h": 256},
+                ),
+                CenterCrop(args={"img_w": 256, "img_h": 256}),
+            ]
         )
+        self.frame_num = int(frame_num)
+        if self.frame_num <= 0 or self.frame_num % 4:
+            raise ValueError("frame_num must be a positive multiple of 4")
+        self.camera_keys = self._resolve_camera_keys(camera_keys)
+        temporal_indices = list(range(self.frame_num))
+        self.delta_indices = {
+            camera["key"]: temporal_indices for camera in self.camera_keys
+        }
+        for key in ("observation.state", "action"):
+            if key in self.meta.features:
+                self.delta_indices[key] = temporal_indices
+        self.multiview_enabled = len(self.camera_keys) > 1
         self.stream_ids = torch.tensor(
             [item["stream_id"] for item in self.camera_keys], dtype=torch.long
         )
         self.num_views = len(self.camera_keys)
         self.num_streams = max(item["stream_id"] for item in self.camera_keys) + 1
-        task_names = {
-            int(row.task_index): str(task) for task, row in self.meta.tasks.iterrows()
-        }
-        self.class_map = LiberoClassMap.from_config(
-            class_suites,
-            available_task_indices=tuple(task_names),
-        )
-        self.num_classes = len(self.class_map)
-        self.class_names = tuple(
-            f"{entry.suite}/{task_names[entry.task_index]}"
-            for entry in self.class_map.entries
-        )
-        self._episodes: list[tuple[int, int, int, LiberoClass, str]] = []
-        columns = self.meta.episodes.select_columns(
-            ["episode_index", "dataset_from_index", "dataset_to_index", "tasks"]
-        )
-        for row in columns:
-            start = int(row["dataset_from_index"])
-            stop = int(row["dataset_to_index"])
-            if stop - start < self.sampler.required_frames:
-                continue
-            task = str(row["tasks"][0])
-            task_index = self.meta.get_task_index(task)
-            if task_index is None:
-                raise ValueError(f"episode references an unknown task: {task!r}")
-            self._episodes.append(
-                (
-                    int(row["episode_index"]),
-                    start,
-                    stop,
-                    self.class_map.for_task_index(task_index),
-                    task,
-                )
+        # Build stable class IDs directly from the dataset's task metadata.
+        task_rows = sorted(
+            (
+                int(row.task_index),
+                str(task),
             )
-        self.clip_fps = float(self.meta.fps)
+            for task, row in self.meta.tasks.iterrows()
+        )
+        self.task_index_to_class_id = {
+            task_index: class_id
+            for class_id, (task_index, _task) in enumerate(task_rows)
+        }
+        self.class_id_to_task_index = {
+            class_id: task_index
+            for task_index, class_id in self.task_index_to_class_id.items()
+        }
+        self.class_names = tuple(task for _task_index, task in task_rows)
+        self.num_classes = len(self.class_names)
+
+    def save_class_map(self, path: str | Path) -> Path:
+        """Persist the metadata-derived task/class mapping for a training run."""
+
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "num_classes": self.num_classes,
+            "task_index_to_class_id": {
+                str(task_index): class_id
+                for task_index, class_id in self.task_index_to_class_id.items()
+            },
+            "class_id_to_task_index": {
+                str(class_id): task_index
+                for class_id, task_index in self.class_id_to_task_index.items()
+            },
+            "class_names": list(self.class_names),
+        }
+        temporary = output.with_name(f".{output.name}.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        temporary.replace(output)
+        return output
+
+    @staticmethod
+    def load_class_map(path: str | Path) -> dict[str, Any]:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            return json.load(handle)
 
     def _resolve_camera_keys(
-        self, camera_keys: Sequence[str | Mapping[str, Any]] | None
+        self, camera_keys: Sequence[Mapping[str, Any]] | None
     ) -> tuple[dict[str, Any], ...]:
-        values = camera_keys or ("observation.images.image",)
-        features = self.meta.features
-        resolved: list[dict[str, Any]] = []
-        seen_keys: set[str] = set()
-        seen_ids: set[int] = set()
-        for position, value in enumerate(values):
-            if isinstance(value, str):
-                key, name, stream_id = value, value, position
-            elif isinstance(value, Mapping) and "key" in value:
-                key = str(value["key"])
-                name = str(value.get("name", key))
-                stream_id = int(value.get("stream_id", position))
-            else:
-                raise ValueError("camera_keys entries must be strings or mappings with key")
-            if key in seen_keys or stream_id in seen_ids or stream_id < 0:
-                raise ValueError("camera keys and stream IDs must be unique")
-            feature = features.get(key)
-            shape = (
-                feature.get("shape")
-                if isinstance(feature, Mapping)
-                else getattr(feature, "shape", None)
-            )
-            dtype = (
-                feature.get("dtype")
-                if isinstance(feature, Mapping)
-                else getattr(feature, "dtype", None)
-            )
-            if (
-                feature is None
-                or str(dtype) != "image"
-                or shape is None
-                or len(shape) != 3
-                or int(shape[-1]) != 3
-            ):
-                raise ValueError(f"camera key {key!r} must be an RGB image feature")
-            resolved.append({"key": key, "name": name, "stream_id": stream_id})
-            seen_keys.add(key)
-            seen_ids.add(stream_id)
-        return tuple(resolved)
+        values = camera_keys or (
+            {"key": "observation.images.image", "name": "image", "stream_id": 0},
+        )
+        return tuple(
+            {
+                "key": str(camera["key"]),
+                "name": str(camera.get("name", camera["key"])),
+                "stream_id": int(camera.get("stream_id", index)),
+            }
+            for index, camera in enumerate(values)
+        )
 
     def __len__(self) -> int:
-        return len(self._episodes)
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = int(epoch)
-
-    def _generator(self, index: int) -> torch.Generator:
-        seed = self.base_seed + self.epoch * 1_000_003 + int(index) * 10_007
-        return torch.Generator(device="cpu").manual_seed(seed % (2**63 - 1))
-
-    def get_frame(self, index: int) -> dict[str, Any]:
-        """Return a native LeRobot frame, including action and state fields."""
-
-        return LeRobotDataset.__getitem__(self, int(index))
+        return super().__len__()
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        episode, start, stop, class_entry, task = self._episodes[index]
-        global_indices = self.sampler(stop - start, generator=self._generator(index)) + start
-        rows = [self.get_frame(row_index) for row_index in global_indices.tolist()]
+        item = super().__getitem__(int(index))
+        episode = int(item["episode_index"])
+        task_index = int(item["task_index"])
+        try:
+            class_id = self.task_index_to_class_id[task_index]
+        except KeyError as error:
+            raise ValueError(f"unmapped task_index from dataset metadata: {task_index}") from error
+        task = self.class_names[class_id]
+        episode_meta = self.meta.episodes[episode]
+        episode_start = int(episode_meta["dataset_from_index"])
+        episode_stop = int(episode_meta["dataset_to_index"])
+        current_index = int(item["index"])
+        global_indices = torch.arange(self.frame_num, dtype=torch.long)
+        global_indices = (current_index + global_indices).clamp(
+            min=episode_start,
+            max=episode_stop - 1,
+        )
         views: list[torch.Tensor] = []
-        reference_shape: tuple[int, int, int] | None = None
         for camera in self.camera_keys:
-            frames = []
-            for row in rows:
-                frame = row[camera["key"]]
-                if frame.ndim == 3 and frame.shape[-1] == 3:
-                    frame = frame.permute(2, 0, 1)
-                if frame.ndim != 3 or frame.shape[0] != 3:
-                    raise ValueError(f"camera {camera['key']!r} must decode to [3,H,W]")
-                frame = frame.float()
-                if float(frame.max()) > 1.0:
-                    frame = frame / 255.0
-                frames.append(frame)
-            view = torch.stack(frames)
-            shape = tuple(int(value) for value in view.shape[1:])
-            if reference_shape is None:
-                reference_shape = shape
-            elif shape != reference_shape:
-                raise ValueError("all camera views must share channels and resolution")
+            view = item[camera["key"]].float()
+            if float(view.max()) > 1.0:
+                view = view / 255.0
             views.append(view)
         video = torch.stack(views, dim=1)
-        if self.image_size is not None and tuple(video.shape[-2:]) != (
-            self.image_size,
-            self.image_size,
-        ):
-            video = torch.nn.functional.interpolate(
-                video.flatten(0, 1),
-                size=(self.image_size, self.image_size),
-                mode="bilinear",
-                align_corners=False,
-            ).reshape(
-                video.shape[0],
-                video.shape[1],
-                3,
-                self.image_size,
-                self.image_size,
-            )
-        if self.random_flip and bool(torch.rand((), generator=self._generator(index)) < 0.5):
-            video = video.flip(-1)
-        output_video = video if self.multiview_enabled else video[:, 0]
         result: dict[str, Any] = {
-            "video": output_video,
-            "label": class_entry.class_id,
-            "class_name": self.class_names[class_entry.class_id],
-            "suite": class_entry.suite,
-            "suite_task_index": class_entry.suite_task_index,
-            "source_task_index": class_entry.task_index,
+            "video": video,
+            "label": class_id,
             "sample_id": f"episode-{episode:06d}",
-            "path": str(Path(self.meta.root) / self.meta.get_data_file_path(episode)),
             "frame_indices": global_indices,
-            "video_metadata": {
-                "fps": self.clip_fps,
-                "num_frames": stop - start,
-                "height": int(output_video.shape[-2]),
-                "width": int(output_video.shape[-1]),
-                "channels": int(output_video.shape[-3]),
-                "num_views": self.num_views,
-            },
             "task": task,
-            "extra": {
-                "episode_index": episode,
-                "task": task,
-                "suite": class_entry.suite,
-                "suite_task_index": class_entry.suite_task_index,
-                "source_task_index": class_entry.task_index,
-            },
+            "prompt": DEFAULT_PROMPT.format(task=task),
+            "state": item["observation.state"],
+            "action": item["action"],
+            "stream_ids": self.stream_ids.clone()
         }
-        if all("observation.state" in row for row in rows):
-            state = torch.stack([row["observation.state"] for row in rows])
-            result["state"] = state
-            result["extra"]["state"] = state
-        if all("action" in row for row in rows):
-            action = torch.stack([row["action"] for row in rows])
-            result["action"] = action
-            result["extra"]["action"] = action
-        if self.multiview_enabled:
-            result["stream_ids"] = self.stream_ids.clone()
         return result
 
 
