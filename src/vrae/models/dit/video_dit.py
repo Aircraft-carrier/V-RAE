@@ -120,9 +120,13 @@ class VRAEVideoDiT(nn.Module):
             gradient_checkpointing = bool(use_gradient_checkpointing)
 
         self.num_chunks = int(num_chunks)
+        if self.num_chunks <= 0:
+            raise ValueError("num_chunks must be positive")
         if input_size is not None:
             grid_size = input_size
         if height is not None:
+            if width is None:
+                raise ValueError("width is required when height is provided")
             grid_size = (height, width)
         if isinstance(grid_size, int):
             self.grid_size = (int(grid_size), int(grid_size))
@@ -133,6 +137,15 @@ class VRAEVideoDiT(nn.Module):
             self.patch_size = (int(patch_size), int(patch_size))
         else:
             self.patch_size = (int(patch_size[0]), int(patch_size[1]))
+        if any(size <= 0 for size in self.grid_size):
+            raise ValueError("grid_size values must be positive")
+        if any(patch <= 0 for patch in self.patch_size):
+            raise ValueError("patch_size values must be positive")
+        if any(
+            size % patch != 0
+            for size, patch in zip(self.grid_size, self.patch_size, strict=True)
+        ):
+            raise ValueError("grid_size values must be divisible by patch_size")
         self.patch_grid = tuple(
             size // patch
             for size, patch in zip(self.grid_size, self.patch_size, strict=True)
@@ -161,7 +174,11 @@ class VRAEVideoDiT(nn.Module):
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.multiview_enabled = bool(multiview_enabled)
         self.num_views = int(num_views)
+        if self.num_views <= 0:
+            raise ValueError("num_views must be positive")
         self.num_streams = self.num_views
+        if not 1 <= self.base_model_depth <= enc_depth:
+            raise ValueError("base_model_depth must be within encoder depth")
 
         self.encoder_embed = FramePatchEmbed(self.in_channels, enc_dim, self.patch_size)
         self.decoder_embed = FramePatchEmbed(self.in_channels, dec_dim, self.patch_size)
@@ -224,8 +241,7 @@ class VRAEVideoDiT(nn.Module):
             self.patch_grid[0],
             self.patch_grid[1],
         )
-        self.register_buffer("_encoder_positions", positions, persistent=False)
-        self.register_buffer("_decoder_positions", positions.clone(), persistent=False)
+        self.register_buffer("_precomputed_positions", positions, persistent=False)
         self._encoder_rope_cache: tuple[object, ...] | None = None
         self._decoder_rope_cache: tuple[object, ...] | None = None
         self._initialize_weights()
@@ -351,12 +367,12 @@ class VRAEVideoDiT(nn.Module):
     def _prepare_input_grid(
         self,
         noisy: torch.Tensor,
-    ) -> tuple[torch.Tensor, tuple[int, ...], int]:
+    ) -> tuple[torch.Tensor, int, int]:
         """Convert token latents to the shared ``[B*V,T,C,H,W]`` path.
 
         Returns:
             grid: [B*V*T,C,H,W] tensor
-            shape: original noisy shape
+            batch_size: batch size B
             views: number of views V
         """
         views = self.num_views if self.multiview_enabled else 1
@@ -386,7 +402,7 @@ class VRAEVideoDiT(nn.Module):
             self.in_channels,
             *self.grid_size,
         )
-        return grid, tuple(noisy.shape), views
+        return grid, batch, views
 
     def _validate_forward_inputs(
         self,
@@ -482,7 +498,7 @@ class VRAEVideoDiT(nn.Module):
         embedder: FramePatchEmbed,
         view_embedding: nn.Embedding,
         grid: torch.Tensor,
-        shape: tuple[int, ...],
+        batch_size: int,
         views: int,
         stream_ids: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -490,7 +506,6 @@ class VRAEVideoDiT(nn.Module):
         """
         # P = Ph*Pw = number of patches per chunk
         # D = embedding dimension
-        batch = shape[0]
         # [B*V*T,C,H,W]
         #   -> [B*V*T,D,Ph,Pw]
         #   -> [B*V*T,P,D]
@@ -498,7 +513,7 @@ class VRAEVideoDiT(nn.Module):
         sequence = embed_video_frames(
             embedder,
             grid,
-            batch_size=batch * views,
+            batch_size=batch_size * views,
             chunks=self.num_chunks,
         )
 
@@ -515,7 +530,7 @@ class VRAEVideoDiT(nn.Module):
             # [B*V, T*P, D]
             #     -> [B, V, T, P, D]
             sequence = sequence.reshape(
-                batch,
+                batch_size,
                 views,
                 self.num_chunks,
                 patches,
@@ -549,7 +564,7 @@ class VRAEVideoDiT(nn.Module):
             # [B, T, V, P, D]
             #     -> [B, T*V*P, D]
             sequence = sequence.reshape(
-                batch,
+                batch_size,
                 -1,
                 sequence.shape[-1],
             )
@@ -560,14 +575,8 @@ class VRAEVideoDiT(nn.Module):
         # For multiple views, sequence has been reshaped to:
         # [B, T*V*P, D]
 
-        base_positions = (
-            self._encoder_positions
-            if embedder is self.encoder_embed
-            else self._decoder_positions
-        )
-
         return sequence, self._build_positions(
-            base_positions,
+            self._precomputed_positions,
             patches=patches,
             views=views,
         )
@@ -584,7 +593,7 @@ class VRAEVideoDiT(nn.Module):
         restored = restored.reshape(batch, views, self.num_chunks, self.patches_per_chunk, -1)
         return restored.permute(0, 2, 1, 3, 4).contiguous()
 
-    def forward(
+    def prepare(
         self,
         noisy: torch.Tensor,
         time: torch.Tensor,
@@ -595,9 +604,15 @@ class VRAEVideoDiT(nn.Module):
         class_drop_mask: torch.Tensor | None = None,
         condition_generator: torch.Generator | None = None,
         stream_ids: torch.Tensor | None = None,
-        return_base: bool = False,
-        return_intermediate: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[Any, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        int,
+        int,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        """Prepare validated inputs for the VideoDiT tensor core."""
         noisy, time, labels, drop_mask, stream_ids = self._validate_forward_inputs(
             noisy,
             time,
@@ -607,8 +622,7 @@ class VRAEVideoDiT(nn.Module):
             class_drop_mask,
             stream_ids,
         )
-        grid, shape, views = self._prepare_input_grid(noisy)
-
+        grid, batch_size, views = self._prepare_input_grid(noisy)
         time_embedding = self.time_embedder(time.to(noisy.device))
         label_embedding, _, _ = self.condition_adapter.prepare(
             labels,
@@ -618,16 +632,33 @@ class VRAEVideoDiT(nn.Module):
         encoder_condition = time_embedding + label_embedding.to(
             time_embedding.dtype
         )
+        return (
+            grid,
+            batch_size,
+            views,
+            time_embedding,
+            encoder_condition,
+            stream_ids,
+        )
 
+    def _forward_core(
+        self,
+        grid: torch.Tensor,
+        batch_size: int,
+        views: int,
+        time_embedding: torch.Tensor,
+        encoder_condition: torch.Tensor,
+        stream_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run encoder and decoder blocks on prepared tensor inputs."""
         sequence, encoder_positions = self._embed_sequence(
             self.encoder_embed,
             self.encoder_view_embedding,
             grid,
-            shape,
+            batch_size,
             views,
             stream_ids,
         )
-
         encoder_rope_cache = self._cached_rope(
             scope="encoder",
             positions=encoder_positions,
@@ -656,18 +687,16 @@ class VRAEVideoDiT(nn.Module):
             self.decoder_embed,
             self.decoder_view_embedding,
             grid,
-            shape,
+            batch_size,
             views,
             stream_ids,
         )
-
         decoder_rope_cache = self._cached_rope(
             scope="decoder",
             positions=decoder_positions,
             hidden=decoder_sequence,
             block=self.decoder_blocks[0],
         )
-
         for block in self.decoder_blocks:
             decoder_sequence = self._run_conditioned_block(
                 block,
@@ -676,19 +705,26 @@ class VRAEVideoDiT(nn.Module):
                 decoder_positions,
                 decoder_rope_cache,
             )
+
         full_tokens = self.final_layer(decoder_sequence, decoder_condition)
         base_condition = F.silu(time_embedding + base_sequence)
         base_tokens = self.base_final_layer(base_condition, base_condition)
-        full = self._restore_output(
-            full_tokens,
-            batch=shape[0],
-            views=views,
-        )
-        base = self._restore_output(
-            base_tokens,
-            batch=shape[0],
-            views=views,
-        )
+        return full_tokens, base_tokens, base_sequence
+
+    def post(
+        self,
+        full_tokens: torch.Tensor,
+        base_tokens: torch.Tensor,
+        base_sequence: torch.Tensor,
+        *,
+        batch_size: int,
+        views: int,
+        return_base: bool,
+        return_intermediate: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[Any, torch.Tensor]:
+        """Restore latent grids and assemble the requested outputs."""
+        full = self._restore_output(full_tokens, batch=batch_size, views=views)
+        base = self._restore_output(base_tokens, batch=batch_size, views=views)
         result: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
         if return_base:
             result = (full, base)
@@ -697,6 +733,41 @@ class VRAEVideoDiT(nn.Module):
         if return_intermediate:
             return result, base_sequence
         return result
+
+    def forward(
+        self,
+        noisy: torch.Tensor,
+        time: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        *,
+        context: torch.Tensor | None = None,
+        condition_drop_mask: torch.Tensor | None = None,
+        class_drop_mask: torch.Tensor | None = None,
+        condition_generator: torch.Generator | None = None,
+        stream_ids: torch.Tensor | None = None,
+        return_base: bool = False,
+        return_intermediate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[Any, torch.Tensor]:
+        prepared = self.prepare(
+            noisy,
+            time,
+            labels,
+            context=context,
+            condition_drop_mask=condition_drop_mask,
+            class_drop_mask=class_drop_mask,
+            condition_generator=condition_generator,
+            stream_ids=stream_ids,
+        )
+        full_tokens, base_tokens, base_sequence = self._forward_core(*prepared)
+        return self.post(
+            full_tokens,
+            base_tokens,
+            base_sequence,
+            batch_size=prepared[1],
+            views=prepared[2],
+            return_base=return_base,
+            return_intermediate=return_intermediate,
+        )
 
 
 def _factory_parameters(
