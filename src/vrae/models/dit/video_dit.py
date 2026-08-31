@@ -26,50 +26,6 @@ from vrae.models.rope3d import (
 from vrae.registry import DIT_MODELS
 
 
-# Shape notation used below:
-#   B = batch size
-#   T = number of temporal chunks (self.num_chunks)
-#   V = number of views (self.num_views)
-#   N = number of spatial tokens per chunk
-#   C = input channel count (self.in_channels)
-#   P = number of patches per chunk
-#   E = encoder hidden size
-#   D = decoder hidden size
-#   L = sequence length: T*P for single-view, T*V*P for multiview
-#
-# The diffusion or flow-matching transport supplies the noisy latent:
-#   single-view: noisy [B,T,N,C]
-#   multiview:   noisy [B,T,V,N,C]
-#
-# Overall data flow:
-#
-#   noisy
-#      │
-#      ├──► encoder patch embedding
-#      │         │
-#      │         ▼
-#      │      Encoder blocks
-#      │         │
-#      │         ├──► base_sequence
-#      │         │       └──► base_final_layer ──► base
-#      │         │
-#      │         └──► encoder final sequence
-#      │                    │
-#      │                    └──► encoder_to_decoder
-#      │                                  │
-#      └──► decoder patch embedding       ▼
-#                    │              decoder_condition
-#                    ▼                    │
-#                Decoder blocks ◄─────────┘
-#                    │
-#                    ▼
-#                final_layer ──► full
-#
-#   Possible outputs:
-#   full
-#   (full, base)
-#   (full, base_sequence)
-#   ((full, base), base_sequence)
 class VRAEVideoDiT(nn.Module):
     """Class-conditional VideoDiT over frozen V-RAE latent tokens.
 
@@ -379,24 +335,13 @@ class VRAEVideoDiT(nn.Module):
         if not self.multiview_enabled:
             noisy = noisy.unsqueeze(2)
         batch = noisy.shape[0]
-        # [B, K, V, N, C]
-        #   -> [B, V, K, N, C]
         tokens = noisy.permute(0, 2, 1, 3, 4).contiguous()
-        # [B, V, K, N, C]
-        #   -> [B*V, K, H, W, C]
         tokens = tokens.reshape(
             batch * views,
             self.num_chunks,
             *self.grid_size,
             self.in_channels,
         )
-        # [B*V, K, H, W, C]
-        #   -> permute(0, 1, 4, 2, 3)
-        # [B*V, K, C, H, W]
-        #
-        # 然后把 B*V 和 K 合并：
-        # [B*V, K, C, H, W]
-        #   -> [B*V*K, C, H, W]
         grid = tokens.permute(0, 1, 4, 2, 3).reshape(
             batch * views * self.num_chunks,
             self.in_channels,
@@ -474,19 +419,6 @@ class VRAEVideoDiT(nn.Module):
     def _build_positions(self, base: torch.Tensor, *, patches: int, views: int) -> torch.Tensor:
         if views == 1:
             return base
-        # [T * P, 3]
-        #     -> [T, P, 3]
-        #
-        # `[:, None]`：
-        # [T, P, 3]
-        #     -> [T, 1, P, 3]
-        #
-        # `expand(-1, views, -1, -1)`：
-        # [T, 1, P, 3]
-        #     -> [T, V, P, 3]
-        #
-        # [T, V, P, 3]
-        #     -> [T * V * P, 3]
         return (
             base.reshape(self.num_chunks, patches, 3)[:, None]
             .expand(-1, views, -1, -1)
@@ -504,12 +436,6 @@ class VRAEVideoDiT(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Embed a prepared latent grid and add view-specific embeddings.
         """
-        # P = Ph*Pw = number of patches per chunk
-        # D = embedding dimension
-        # [B*V*T,C,H,W]
-        #   -> [B*V*T,D,Ph,Pw]
-        #   -> [B*V*T,P,D]
-        #   -> [B*V,T*P, D]
         sequence = embed_video_frames(
             embedder,
             grid,
@@ -517,18 +443,9 @@ class VRAEVideoDiT(nn.Module):
             chunks=self.num_chunks,
         )
 
-        # sequence.shape:
-        # [B*V, T*P, D]
         patches = sequence.shape[1] // self.num_chunks
 
-        # Only multiview inputs require the following steps:
-        # 1. Split B and V
-        # 2. Reorder the tokens
-        # 3. Add view-specific embeddings
-        # 4. Flatten back into a Transformer sequence
         if views > 1:
-            # [B*V, T*P, D]
-            #     -> [B, V, T, P, D]
             sequence = sequence.reshape(
                 batch_size,
                 views,
@@ -537,9 +454,6 @@ class VRAEVideoDiT(nn.Module):
                 sequence.shape[-1],
             )
 
-            # [B, V, T, P, D]
-            #     -> [B, T, V, P, D]
-            # The final token order is chunk, view, then patch.
             sequence = sequence.permute(0, 2, 1, 3, 4)
 
             if stream_ids is None:
@@ -547,33 +461,14 @@ class VRAEVideoDiT(nn.Module):
                     "stream_ids are required for multiview embedding"
                 )
 
-            # stream_ids:
-            # [B, V]
-            #
-            # view_embedding(stream_ids):
-            # [B, V] -> [B, V, D]
-            #
-            # After adding two dimensions of length 1:
-            # [B, V, D] -> [B, 1, V, 1, D]
-            #
-            # When added to [B, T, V, P, D], broadcasting applies the same
-            # view embedding to all chunks and patches of that view.
             view_bias = view_embedding(stream_ids).to(sequence.dtype)
             sequence = sequence + view_bias[:, None, :, None]
 
-            # [B, T, V, P, D]
-            #     -> [B, T*V*P, D]
             sequence = sequence.reshape(
                 batch_size,
                 -1,
                 sequence.shape[-1],
             )
-
-        # For a single view, sequence remains:
-        # [B, T*P, D]
-        #
-        # For multiple views, sequence has been reshaped to:
-        # [B, T*V*P, D]
 
         return sequence, self._build_positions(
             self._precomputed_positions,
